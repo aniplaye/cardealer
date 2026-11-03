@@ -179,11 +179,29 @@ local function collectTarget(part, radius)
 	tryTouch(part)
 end
 
+local function findVehicleOf(seat)
+	if not seat then return nil end
+	-- deobfuscated.lua trace saw SeatPart.Parent.Parent, but nesting varies:
+	-- climb ancestors and take the highest Model (the actual car), not workspace.
+	local node, top = seat.Parent, nil
+	while node and node ~= workspace do
+		local ok, isModel = pcall(function() return node:IsA("Model") end)
+		if ok and isModel then top = node end
+		node = node.Parent
+	end
+	return top
+end
+
 local function moveTo(cf)
 	local seat = seatOf()
 	if seat then
-		local vehicle = seat.Parent and seat.Parent.Parent
-		if vehicle and vehicle:IsA("Model") then
+		local vehicle = findVehicleOf(seat)
+		if not vehicle then
+			-- legacy fallback: exact deobf chain
+			local v = seat.Parent and seat.Parent.Parent
+			pcall(function() if v and v:IsA("Model") then vehicle = v end end)
+		end
+		if vehicle then
 			local ok = pcall(function()
 				for _, p in ipairs(vehicle:GetDescendants()) do
 					if p:IsA("BasePart") then
@@ -278,7 +296,7 @@ Window = VantixUI:CreateWindow({
 })
 
 Window:CreateTag("Beta", Color3.fromRGB(240, 100, 100), nil, "flask-conical")
-Window:CreateTag("V1.4", Color3.fromRGB(60, 120, 210), nil, "git-branch")
+Window:CreateTag("V1.5", Color3.fromRGB(60, 120, 210), nil, "git-branch")
 
 Window:Notify({
 	Title    = "Vena's private Bypass",
@@ -888,17 +906,60 @@ local raceSpeedBox = RaceTab:AddTextBox({
 	end,
 })
 
+local function findRaceFolders()
+	local folders = {}
+	local function push(f) if f then table.insert(folders, f) end end
+	push(workspace:FindFirstChild("Races"))
+	-- broad sweep: anything with race/halloween in the name that could hold a course
+	pcall(function()
+		for _, kid in ipairs(workspace:GetChildren()) do
+			local okN, n = pcall(function() return kid.Name:lower() end)
+			if okN and n and (n:find("race") or n:find("halloween")) then
+				local dup = false
+				for _, f in ipairs(folders) do if f == kid then dup = true break end end
+				if not dup and (kid:IsA("Folder") or kid:IsA("Model")) then
+					push(kid)
+				end
+			end
+		end
+	end)
+	return folders
+end
+
+local function findHalloweenRoot()
+	for _, folder in ipairs(findRaceFolders()) do
+		local ok, kids = pcall(function() return folder:GetChildren() end)
+		if ok and kids then
+			for _, r in ipairs(kids) do
+				local okN, n = pcall(function() return r.Name:lower() end)
+				if okN and n and n:find("halloween") then return r, folder end
+			end
+		end
+	end
+	return nil, nil
+end
+
 local function getRaceList()
 	local names = { "All" }
 	pcall(function()
-		local races = workspace:FindFirstChild("Races")
-		if races then
-			for _, r in ipairs(races:GetChildren()) do
-				table.insert(names, r.Name)
+		for _, folder in ipairs(findRaceFolders()) do
+			for _, r in ipairs(folder:GetChildren()) do
+				local n = r.Name
+				local dup = false
+				for _, e in ipairs(names) do if e == n then dup = true break end end
+				if not dup then table.insert(names, n) end
 			end
 		end
 	end)
 	return names
+end
+
+local function findRaceRootByName(name)
+	for _, folder in ipairs(findRaceFolders()) do
+		local f = folder:FindFirstChild(name)
+		if f then return f end
+	end
+	return nil
 end
 
 local targetRaceDropdown = RaceTab:AddDropdown({
@@ -909,6 +970,37 @@ local targetRaceDropdown = RaceTab:AddDropdown({
 	Callback = function(selected)
 		SelectedRace = selected
 		pcall(function() console:Write("Target race: " .. tostring(selected)) end)
+	end,
+})
+
+RaceTab:AddButton({
+	Title    = "Go To Halloween Race",
+	Subtitle = "Teleports to the Halloween course",
+	Icon     = "ghost",
+	Text     = "Go",
+	Callback = function()
+		local root, folder = findHalloweenRoot()
+		if not root then
+			notify("No Halloween race found (use Refresh, check console)")
+			pcall(function()
+				local names = table.concat(getRaceList(), ", ")
+				console:Write("Races found: " .. names)
+				status:Set("Status: no Halloween race in list")
+			end)
+			return
+		end
+		local cps = collectRaceParts(root)
+		if #cps == 0 then
+			notify("Halloween race has no parts: " .. root:GetFullName())
+			return
+		end
+		SelectedRace = root.Name
+		pcall(function() targetRaceDropdown:SetOptions(getRaceList()) end)
+		collectRacePoint(cps[1])
+		pcall(function()
+			console:Write("Halloween race: " .. root:GetFullName() .. " (" .. #cps .. " points)")
+			status:Set("Status: at Halloween race " .. root.Name .. " (1/" .. #cps .. ")")
+		end)
 	end,
 })
 
@@ -998,12 +1090,22 @@ local function driveCheckpoints(flagKey, runningKey, mode)
 					pcall(function() status:Set("Status: Race - workspace.Races not found") end)
 					return
 				end
+				local folders = findRaceFolders()
+				local races = workspace:FindFirstChild("Races")
+				if #folders == 0 then
+					pcall(function() status:Set("Status: Race - no race folders found") end)
+					return
+				end
 				local roots = {}
 				if SelectedRace and SelectedRace ~= "All" then
-					local one = races:FindFirstChild(SelectedRace)
+					local one = findRaceRootByName(SelectedRace)
 					if one then table.insert(roots, one) end
 				else
-					roots = races:GetChildren()
+					for _, folder in ipairs(folders) do
+						for _, r in ipairs(folder:GetChildren()) do
+							table.insert(roots, r)
+						end
+					end
 				end
 				if #roots == 0 then
 					pcall(function() status:Set("Status: Race - no races (use Refresh)") end)
@@ -1120,8 +1222,8 @@ MiscTab:AddLabel("Race Teleports", "map-pin")
 
 local raceNames = { "None" }
 pcall(function()
-	for _, r in ipairs(workspace.Races:GetChildren()) do
-		table.insert(raceNames, r.Name)
+	for _, n in ipairs(getRaceList()) do
+		if n ~= "All" then table.insert(raceNames, n) end
 	end
 end)
 
@@ -1133,7 +1235,7 @@ MiscTab:AddDropdown({
 	Callback = function(selected)
 		if selected == "None" then return end
 		pcall(function()
-			local dest = workspace.Races:FindFirstChild(selected)
+			local dest = findRaceRootByName(selected)
 			local part = firstPart(dest)
 			if part then
 				moveTo(part.CFrame + Vector3.new(0, 5, 0))
