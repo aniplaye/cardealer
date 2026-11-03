@@ -266,6 +266,26 @@ local function cachedDescs(folder, wantParts)
 	return list
 end
 
+local function findCollectableFolders()
+	local folders = {}
+	local function push(f)
+		if not f then return end
+		for _, e in ipairs(folders) do if e == f then return end end
+		table.insert(folders, f)
+	end
+	push(workspace:FindFirstChild("HalloweenPumpkinsLocal"))
+	push(workspace:FindFirstChild("Collectibles"))
+	pcall(function()
+		for _, kid in ipairs(workspace:GetChildren()) do
+			if kid:IsA("Folder") or kid:IsA("Model") then
+				local okN, n = pcall(function() return kid.Name:lower() end)
+				if okN and n and n:find("collect") then push(kid) end
+			end
+		end
+	end)
+	return folders
+end
+
 local function numericNameSort(list)
 	table.sort(list, function(a, b)
 		local na, nb = a.Name, b.Name
@@ -308,7 +328,7 @@ Window = VantixUI:CreateWindow({
 })
 
 Window:CreateTag("Beta", Color3.fromRGB(240, 100, 100), nil, "flask-conical")
-Window:CreateTag("V2.0", Color3.fromRGB(60, 120, 210), nil, "git-branch")
+Window:CreateTag("V2.1", Color3.fromRGB(60, 120, 210), nil, "git-branch")
 
 Window:Notify({
 	Title    = "Vena's private Bypass",
@@ -519,16 +539,15 @@ MainTab:AddButton({
 
 MainTab:AddToggle({
 	Title    = "Auto Collect Pumpkins",
-	Subtitle = "Farms HalloweenPumpkinsLocal",
+	Subtitle = "Farms pumpkins + all collectables",
 	Icon     = "flask-conical",
 	Default  = false,
 	Callback = function(state)
 		Flags.AutoPumpkins = state
 		report("Auto Collect Pumpkins", state)
 		if not state or Flags._pumpkinsRunning then return end
-		local folder = workspace:FindFirstChild("HalloweenPumpkinsLocal")
-		if not folder then
-			notify("HalloweenPumpkinsLocal not found")
+		if #findCollectableFolders() == 0 then
+			notify("No collectables found (no pumpkin/collect folder)")
 			Flags.AutoPumpkins = false
 			return
 		end
@@ -536,39 +555,63 @@ MainTab:AddToggle({
 		task.spawn(function()
 			local pumpErrs = 0
 			while Flags.AutoPumpkins and not Unloaded do
-				local live = workspace:FindFirstChild("HalloweenPumpkinsLocal")
-				if not live then
-					pcall(function() status:Set("Status: Pumpkins - folder gone, waiting") end)
+				local folders = findCollectableFolders()
+				if #folders == 0 then
+					pcall(function() status:Set("Status: Collectables - none found, waiting") end)
 					task.wait(2)
 				else
-					local kids = {}
-					pcall(function() kids = live:GetChildren() end)
-					if #kids == 0 then
+					-- gather from every collectable folder (pumpkins are direct children,
+					-- Collectibles are nested): cap + nearest-first so big maps stay smooth
+					local targets, seen = {}, {}
+					local from = hrpPos()
+					for _, folder in ipairs(folders) do
+						local kids = {}
+						pcall(function() kids = folder:GetChildren() end)
+						for _, kid in ipairs(kids) do
+							local part
+							pcall(function() part = firstPart(kid) end)
+							if part and not seen[part] then
+								seen[part] = true
+								table.insert(targets, part)
+								if #targets >= 60 then break end
+							end
+						end
+						if #targets >= 60 then break end
+						if #targets < 60 then
+							for _, d in ipairs(cachedDescs(folder, true)) do
+								if not seen[d] then
+									seen[d] = true
+									table.insert(targets, d)
+									if #targets >= 60 then break end
+								end
+							end
+						end
+						if #targets >= 60 then break end
+					end
+					if #targets == 0 then
 						task.wait(1)
 					else
-						for _, pumpkin in ipairs(kids) do
+						sortedByDistance(targets, from)
+						for _, part in ipairs(targets) do
 							if not Flags.AutoPumpkins or Unloaded then break end
 							local okItem = pcall(function()
-								local part = firstPart(pumpkin)
-								if part then
-									collectTarget(part, 16)
-									-- deobfuscated.lua: Collectibles.Halloween2026Pumpkins(.Roll) touched
-									-- at startup (4x unrolled accesses); try Roll per pumpkin.
-									pcall(function()
-										local db = Collectibles and Collectibles.Halloween2026Pumpkins
-										local roll = db and db.Roll
-										if type(roll) == "function" then
-											roll(db)
-										elseif roll and roll.InvokeServer then
-											roll:InvokeServer()
-										end
-									end)
-								end
+								collectTarget(part, 16)
+								-- deobfuscated.lua: Collectibles.Halloween2026Pumpkins(.Roll)
+								-- touched at startup; try Roll whenever we touch anything.
+								pcall(function()
+									local db = Collectibles and Collectibles.Halloween2026Pumpkins
+									local roll = db and db.Roll
+									if type(roll) == "function" then
+										roll(db)
+									elseif roll and roll.InvokeServer then
+										roll:InvokeServer()
+									end
+								end)
 							end)
 							if okItem then pumpErrs = 0 else pumpErrs += 1 end
 							if pumpErrs >= 15 then
 								Flags.AutoPumpkins = false
-								notify("Auto Collect Pumpkins stopped: 15 errors in a row")
+								notify("Auto Collect stopped: 15 errors in a row")
 								break
 							end
 							task.wait(0.5)
