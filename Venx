@@ -4,7 +4,22 @@
 -- (behaviorally reconstructed via sandbox tracing). No whitelist / key check anywhere.
 -- Executor file used: cdtdelivery.txt ("<stars> <minReward> <maxReward>").
 
-local VantixUI = loadstring(game:HttpGet("https://raw.githubusercontent.com/Snipez-Dev/Vantix/refs/heads/main/VantixUI6"))()
+local VantixUI = nil
+do
+	local lastErr = nil
+	for attempt = 1, 3 do
+		local ok, lib = pcall(function()
+			return loadstring(game:HttpGet("https://raw.githubusercontent.com/Snipez-Dev/Vantix/refs/heads/main/VantixUI6"))()
+		end)
+		if ok and lib then VantixUI = lib break end
+		lastErr = lib
+		task.wait(2)
+	end
+	if not VantixUI then
+		warn("Vena's private Bypass: VantixUI failed to load: " .. tostring(lastErr))
+		return
+	end
+end
 
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -18,23 +33,39 @@ local Unloaded = false
 local Window -- forward-declared so notify() (defined below) closes over the real window
 
 -- ===== 0. Anti-AFK / anti-detection prologue (runs before UI) =====
-LP.Idled:connect(function()
-	VirtualUser:Button2Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
-	task.wait(1)
-	VirtualUser:Button2Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+-- Hardened: nothing here may kill the script if an executor API is missing.
+pcall(function()
+	if LP and LP.Idled then
+		LP.Idled:Connect(function()
+			pcall(function()
+				local cam = workspace.CurrentCamera
+				if cam then
+					VirtualUser:Button2Down(Vector2.new(0, 0), cam.CFrame)
+					task.wait(1)
+					VirtualUser:Button2Up(Vector2.new(0, 0), cam.CFrame)
+				end
+			end)
+		end)
+	end
 end)
+pcall(function() workspace.DescendantAdded:Connect(function(_) end) end)
+pcall(function() local _ = workspace:GetDescendants() end)
 
-workspace.DescendantAdded:Connect(function(_) end)
-local _ = workspace:GetDescendants()
-
-local mt = getrawmetatable(game)
-setreadonly(mt, false)
-local oldNamecall = mt.__namecall
-mt.__namecall = newcclosure(function(self, ...)
-	local method = getnamecallmethod()
-	-- deobfuscated.lua trace: __namecall hook installed; typical pattern blocks Kick/Ban
-	if method == "Kick" then return nil end
-	return oldNamecall(self, ...)
+pcall(function()
+	if typeof(getrawmetatable) == "function" and typeof(newcclosure) == "function" then
+		local mt = getrawmetatable(game)
+		if mt then
+			if typeof(setreadonly) == "function" then setreadonly(mt, false) end
+			local oldNamecall = mt.__namecall
+			mt.__namecall = newcclosure(function(self, ...)
+				local method = nil
+					pcall(function() method = getnamecallmethod() end)
+				-- deobfuscated.lua trace: __namecall hook installed; typical pattern blocks Kick/Ban
+				if method == "Kick" then return nil end
+				return oldNamecall(self, ...)
+			end)
+		end
+	end
 end)
 
 -- ===== 1. Collectibles database (Halloween 2026) =====
@@ -78,15 +109,74 @@ local function firstPart(obj)
 	return found
 end
 
-local function fireNearbyPrompts(pos, radius)
-	for _, p in ipairs(workspace:GetDescendants()) do
-		if p:IsA("ProximityPrompt") then
-			local parent = firstPart(p.Parent)
-			if parent and (parent.Position - pos).Magnitude <= (radius or 12) then
-				pcall(fireproximityprompt, p)
+-- Single shared prompt cache: one workspace scan every few seconds.
+-- Before this, every farm/race loop scanned ALL of workspace on every
+-- teleport (up to ~10 full scans/sec with 2-3 toggles) which froze low-end
+-- devices until threads looked "suddenly stopped".
+local PromptCache = {}
+local PromptCacheAt = 0
+task.spawn(function()
+	while not Unloaded do
+		local ok = pcall(function()
+			local found = {}
+			for _, p in ipairs(workspace:GetDescendants()) do
+				if p:IsA("ProximityPrompt") then
+					table.insert(found, p)
+				end
 			end
+			PromptCache = found
+			PromptCacheAt = os.clock()
+		end)
+		if not ok then task.wait(2) else task.wait(4) end
+	end
+end)
+
+local function fireNearbyPrompts(pos, radius)
+	local r = radius or 14
+	for _, p in ipairs(PromptCache) do
+		local ok, parent, pp = pcall(function()
+			local par = firstPart(p.Parent)
+			return par, par and par.Position
+		end)
+		if ok and parent and pp and (pp - pos).Magnitude <= r then
+			pcall(fireproximityprompt, p)
 		end
 	end
+end
+
+local function tryTouch(part)
+	if typeof(firetouchinterest) ~= "function" then return end
+	local _, _, root = parts()
+	if not root or not part then return end
+	pcall(function()
+		firetouchinterest(root, part, 0)
+		task.wait(0.15)
+		firetouchinterest(root, part, 1)
+	end)
+end
+
+local function collectTarget(part, radius)
+	if not part then return end
+	moveTo(part.CFrame + Vector3.new(0, 3, 0))
+	-- prompts parented directly to the target first (no scan needed)
+	pcall(function()
+		for _, d in ipairs(part:GetDescendants()) do
+			if d:IsA("ProximityPrompt") then pcall(fireproximityprompt, d) end
+		end
+		if part.Parent then
+			for _, d in ipairs(part.Parent:GetDescendants()) do
+				if d:IsA("ProximityPrompt") then
+					local par = firstPart(d.Parent)
+					if par and (par.Position - part.Position).Magnitude <= 20 then
+						pcall(fireproximityprompt, d)
+					end
+				end
+				if #part.Parent:GetChildren() > 200 then break end
+			end
+		end
+	end)
+	fireNearbyPrompts(part.Position, radius or 14)
+	tryTouch(part)
 end
 
 local function moveTo(cf)
@@ -94,16 +184,68 @@ local function moveTo(cf)
 	if seat then
 		local vehicle = seat.Parent and seat.Parent.Parent
 		if vehicle and vehicle:IsA("Model") then
-			local ok = pcall(function() vehicle:PivotTo(cf) end)
+			local ok = pcall(function()
+				for _, p in ipairs(vehicle:GetDescendants()) do
+					if p:IsA("BasePart") then
+						p.AssemblyLinearVelocity = Vector3.zero
+						p.AssemblyAngularVelocity = Vector3.zero
+					end
+				end
+				vehicle:PivotTo(cf)
+			end)
 			if ok then return true end
 		end
 	end
 	local _, _, root = parts()
 	if root then
-		pcall(function() root.CFrame = cf end)
+		pcall(function()
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
+			root.CFrame = cf
+		end)
 		return true
 	end
 	return false
+end
+
+local function hrpPos()
+	local _, _, root = parts()
+	return root and root.Position
+end
+
+local function safePosOf(obj, fromPos)
+	local ok, p = pcall(function()
+		local part = firstPart(obj)
+		if part then return (part.Position - fromPos).Magnitude end
+		return nil
+	end)
+	if ok then return p end
+	return nil
+end
+
+local function sortedByDistance(list, fromPos)
+	if not fromPos then return list end
+	-- instances can despawn mid-sort (collectibles); never let that kill the loop
+	local dist = {}
+	for _, o in ipairs(list) do
+		dist[o] = safePosOf(o, fromPos) or math.huge
+	end
+	pcall(function()
+		table.sort(list, function(a, b) return (dist[a] or math.huge) < (dist[b] or math.huge) end)
+	end)
+	return list
+end
+
+local function numericNameSort(list)
+	table.sort(list, function(a, b)
+		local na, nb = a.Name, b.Name
+		local xa, xb = na:match("(%d+)"), nb:match("(%d+)")
+		if xa and xb and na:gsub("%d+", "#") == nb:gsub("%d+", "#") then
+			return tonumber(xa) < tonumber(xb)
+		end
+		return na < nb
+	end)
+	return list
 end
 
 -- ===== 2. Delivery config (cdtdelivery.txt) =====
@@ -136,7 +278,7 @@ Window = VantixUI:CreateWindow({
 })
 
 Window:CreateTag("Beta", Color3.fromRGB(240, 100, 100), nil, "flask-conical")
-Window:CreateTag("V1.2", Color3.fromRGB(60, 120, 210), nil, "git-branch")
+Window:CreateTag("V1.3", Color3.fromRGB(60, 120, 210), nil, "git-branch")
 
 Window:Notify({
 	Title    = "Vena's private Bypass",
@@ -151,6 +293,56 @@ local lastPing = "n/a"
 
 local function toHex(c)
 	return string.format("#%02X%02X%02X", math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5))
+end
+
+-- ===== Sky-road autofarm (client-sided, 1000 studs up) =====
+-- Classic dealership farm: a long private road in the sky. Drive it, and when
+-- you reach the edge you are put back at the start. Client-sided parts do not
+-- replicate (FilteringEnabled), so other players do not see this road.
+local SKY = { LEN = 2200, WIDTH = 26, Y_OFF = 1000, EDGE = 160 }
+local function destroySkyRoad()
+	pcall(function()
+		local old = workspace:FindFirstChild("VenasSkyRoad")
+		if old then old:Destroy() end
+	end)
+	Flags.SkyStart, Flags.SkyEnd, Flags.SkyLaps = nil, nil, nil
+end
+local function buildSkyRoad()
+	destroySkyRoad()
+	local _, _, root = parts()
+	local origin = ((root and root.Position) or Vector3.new(0, 50, 0)) + Vector3.new(0, SKY.Y_OFF, 0)
+	local s = origin
+	local e = origin + Vector3.new(SKY.LEN, 0, 0)
+	local folder = Instance.new("Folder")
+	folder.Name = "VenasSkyRoad"
+	pcall(function() folder.Parent = workspace end)
+	local function mkPart(name, size, cf, color)
+		local p = Instance.new("Part")
+		p.Name = name
+		p.Size = size
+		p.CFrame = cf
+		p.Anchored = true
+		p.CanCollide = true
+		if color then p.Color = color end
+		p.Material = Enum.Material.SmoothPlastic
+		p.Parent = folder
+		return p
+	end
+	local mid = (s + e) / 2
+	mkPart("Road", Vector3.new(SKY.LEN, 2, SKY.WIDTH), CFrame.new(mid), Color3.fromRGB(30, 30, 35))
+	-- low guard rails so you do not slide off sideways
+	mkPart("RailL", Vector3.new(SKY.LEN, 6, 1), CFrame.new(mid + Vector3.new(0, 4, SKY.WIDTH / 2)), Color3.fromRGB(200, 60, 60))
+	mkPart("RailR", Vector3.new(SKY.LEN, 6, 1), CFrame.new(mid + Vector3.new(0, 4, -SKY.WIDTH / 2)), Color3.fromRGB(200, 60, 60))
+	-- bright start pad so you can see the loop point
+	mkPart("StartPad", Vector3.new(12, 2.4, SKY.WIDTH), CFrame.new(s), Color3.fromRGB(60, 200, 120))
+	Flags.SkyStart, Flags.SkyEnd, Flags.SkyLaps = s, e, 0
+	return s, e
+end
+local function skyStartCF()
+	local s = Flags.SkyStart
+	if not s then return nil end
+	local p = s + Vector3.new(0, 6, 0)
+	return CFrame.lookAt(p, p + Vector3.new(1, 0, 0))
 end
 
 -- ===== 4. Main (Vehicle) =====
@@ -183,41 +375,85 @@ local autoDriveBox = MainTab:AddTextBox({
 
 MainTab:AddToggle({
 	Title    = "Auto Farm",
-	Subtitle = "Drive-farms while seated",
+	Subtitle = "1000-stud sky road, loops at edge",
 	Icon     = "car",
 	Default  = false,
 	Callback = function(state)
 		Flags.AutoFarm = state
 		report("Auto Farm", state)
-		if not state or Flags._farmRunning then return end
+		if not state then
+			local seat = seatOf()
+			if seat and seat:IsA("VehicleSeat") then pcall(function() seat.ThrottleFloat = 0 end) end
+			return
+		end
+		if Flags._farmRunning then return end
 		Flags._farmRunning = true
 		task.spawn(function()
-			local lastSeat
+			local s, e = buildSkyRoad()
+			local cf = skyStartCF()
+			if cf then moveTo(cf) end
+			task.wait(0.5)
+			notify("Sky road ready - sit in a vehicle to farm")
+			pcall(function() console:Write("Sky road: " .. tostring(math.floor(s.Y)) .. " studs up, length " .. SKY.LEN) end)
+			local warnedSeat = false
+			local errs = 0
 			while Flags.AutoFarm and not Unloaded do
 				local ok = pcall(function()
-					local seat, char = seatOf()
-					if seat then
-						-- deobfuscated.lua trace: Character.Humanoid.SeatPart.Parent.Parent
-						-- + workspace:FindFirstChild + HumanoidRootPart.Position each iteration
-						local _vehicle = seat.Parent and seat.Parent.Parent
-						local _probe = workspace:FindFirstChild(char and char.Name or "")
-						local _, _, _root = parts()
-						local _pos = _root and _root.Position
-						if seat:IsA("VehicleSeat") then
-							lastSeat = seat
+					if not Flags.SkyStart or not Flags.SkyEnd then
+						s, e = buildSkyRoad()
+					end
+					local seat = seatOf()
+					if seat and seat:IsA("VehicleSeat") then
+						pcall(function()
 							seat.MaxSpeed = AutoDriveSpeed
 							seat.ThrottleFloat = 1
-						end
-					elseif lastSeat then
-						pcall(function() lastSeat.ThrottleFloat = 0 end)
-						lastSeat = nil
+						end)
+					elseif not warnedSeat then
+						warnedSeat = true
+						notify("Auto Farm: sit in a vehicle - you are parked on the sky road")
+					end
+					local _, _, root = parts()
+					if not root then task.wait(1) return end
+					local pos = root.Position
+					local nearEdge = (Flags.SkyEnd - pos).Magnitude < SKY.EDGE
+					local fell = pos.Y < (Flags.SkyStart.Y - 80)
+					local lost = (pos - Flags.SkyStart).Magnitude > (SKY.LEN + 400)
+					if nearEdge or fell or lost then
+						local startCF = skyStartCF()
+						if startCF then moveTo(startCF) end
+						Flags.SkyLaps = (Flags.SkyLaps or 0) + 1
+						task.wait(0.4)
+					else
+						local done = math.clamp(pos.X - Flags.SkyStart.X, 0, SKY.LEN)
+						pcall(function()
+							status:Set(string.format("Status: Auto Farm - lap %d, %d/%d studs", Flags.SkyLaps or 0, math.floor(done), SKY.LEN))
+						end)
+						task.wait(0.2)
 					end
 				end)
-				if not ok then task.wait(1) else task.wait(0.5) end
+				if ok then errs = 0 else errs += 1 end
+				if errs >= 15 then
+					Flags.AutoFarm = false
+					notify("Auto Farm stopped: 15 errors in a row")
+					break
+				end
 			end
-			if lastSeat then pcall(function() lastSeat.ThrottleFloat = 0 end) end
+			local seat = seatOf()
+			if seat and seat:IsA("VehicleSeat") then pcall(function() seat.ThrottleFloat = 0 end) end
 			Flags._farmRunning = false
 		end)
+	end,
+})
+
+MainTab:AddButton({
+	Title    = "Destroy Sky Road",
+	Subtitle = "Removes the client-sided farm platform",
+	Icon     = "trash-2",
+	Text     = "Destroy",
+	Callback = function()
+		destroySkyRoad()
+		pcall(function() console:Write("Sky road destroyed") end)
+		pcall(function() status:Set("Status: sky road destroyed") end)
 	end,
 })
 
@@ -245,8 +481,7 @@ MainTab:AddToggle({
 						if not Flags.AutoPumpkins or Unloaded then break end
 						local part = firstPart(pumpkin)
 						if part then
-							moveTo(part.CFrame + Vector3.new(0, 3, 0))
-							fireNearbyPrompts(part.Position, 14)
+							collectTarget(part, 16)
 							-- deobfuscated.lua: Collectibles.Halloween2026Pumpkins(.Roll) touched
 							-- at startup (4x unrolled accesses); try Roll per pumpkin.
 							pcall(function()
@@ -259,7 +494,7 @@ MainTab:AddToggle({
 								end
 							end)
 						end
-						task.wait(0.25)
+						task.wait(0.5)
 					end
 				end
 			end
@@ -294,9 +529,8 @@ MainTab:AddToggle({
 					if not Flags.AutoCollectibles or Unloaded then break end
 					if d:IsA("BasePart") then
 						found = true
-						moveTo(d.CFrame + Vector3.new(0, 3, 0))
-						fireNearbyPrompts(d.Position, 14)
-						task.wait(0.25)
+						collectTarget(d, 16)
+						task.wait(0.5)
 					end
 				end
 				if not found then task.wait(1) end
@@ -454,9 +688,11 @@ MainTab:AddToggle({
 		Flags._deliveryRunning = true
 		task.spawn(function()
 			while Flags.AutoDelivery and not Unloaded do
-				local ok = pcall(function()
+					local ok = pcall(function()
 					-- deobfuscated.lua trace: Head, WaitForChild(Humanoid), Humanoid.Sit
-					local hum = LP.Character and LP.Character:WaitForChild("Humanoid")
+					-- Fixed: WaitForChild hangs forever if dead/respawning -> use instant lookup.
+					local char = LP.Character
+					local hum = char and char:FindFirstChildOfClass("Humanoid")
 					if hum and hum.Sit then
 						local seat = hum.SeatPart
 						if seat and seat:IsA("VehicleSeat") then
@@ -518,6 +754,22 @@ MainTab:AddButton({
 	Callback = function()
 		Window:SetToggleKey(Enum.KeyCode.RightShift)
 		Window:Notify({ Title = "Toggle Key", Text = "Reset to " .. Window:GetToggleKey().Name, Duration = 2 })
+	end,
+})
+
+MainTab:AddButton({
+	Title    = "Stop All Farms",
+	Subtitle = "Kills every farm / race loop",
+	Icon     = "octagon-x",
+	Text     = "Stop",
+	Callback = function()
+		for _, k in ipairs({ "AutoFarm", "AutoPumpkins", "AutoCollectibles", "AutoKit", "AutoFire", "AutoSell", "AutoTraps", "AutoDelivery", "AutoDelivery2", "AutoRace", "AutoDrift", "AutoLaps", "AutoDelux", "AutoCrate", "AutoEvent", "AutoBuy" }) do
+			Flags[k] = false
+		end
+		local seat = seatOf()
+		if seat and seat:IsA("VehicleSeat") then pcall(function() seat.ThrottleFloat = 0 end) end
+		report("All loops", false)
+		pcall(function() status:Set("Status: all stopped") end)
 	end,
 })
 
@@ -602,7 +854,8 @@ DeliveryTab:AddToggle({
 		task.spawn(function()
 			while Flags.AutoDelivery2 and not Unloaded do
 				pcall(function()
-					local hum = LP.Character and LP.Character:WaitForChild("Humanoid")
+					local char = LP.Character
+					local hum = char and char:FindFirstChildOfClass("Humanoid")
 					if hum and hum.Sit then
 						local seat = hum.SeatPart
 						if seat and seat:IsA("VehicleSeat") then
@@ -624,6 +877,7 @@ DeliveryTab:AddToggle({
 local RaceTab = Window:AddTab("Race", "flag")
 
 local AutoRaceSpeed = 100
+local SelectedRace = "All"
 local raceSpeedBox = RaceTab:AddTextBox({
 	Title       = "Enter Auto Race Speed",
 	Icon        = "gauge",
@@ -634,44 +888,135 @@ local raceSpeedBox = RaceTab:AddTextBox({
 	end,
 })
 
-local function driveCheckpoints(flagKey, runningKey, label)
+local function getRaceList()
+	local names = { "All" }
+	pcall(function()
+		local races = workspace:FindFirstChild("Races")
+		if races then
+			for _, r in ipairs(races:GetChildren()) do
+				table.insert(names, r.Name)
+			end
+		end
+	end)
+	return names
+end
+
+local targetRaceDropdown = RaceTab:AddDropdown({
+	Title    = "Target Race",
+	Icon     = "map-pin",
+	Options  = getRaceList(),
+	Default  = "All",
+	Callback = function(selected)
+		SelectedRace = selected
+		pcall(function() console:Write("Target race: " .. tostring(selected)) end)
+	end,
+})
+
+RaceTab:AddButton({
+	Title    = "Refresh Race List",
+	Subtitle = "Rescans workspace.Races",
+	Icon     = "refresh-cw",
+	Text     = "Refresh",
+	Callback = function()
+		local names = getRaceList()
+		pcall(function() targetRaceDropdown:SetOptions(names) end)
+		pcall(function() console:Write("Races found: " .. table.concat(names, ", ")) end)
+	end,
+})
+
+local function collectRaceParts(raceRoot)
+	local strict, fallback = {}, {}
+	for _, d in ipairs(raceRoot:GetDescendants()) do
+		if d:IsA("BasePart") then
+			local n = d.Name:lower()
+			if n:find("checkpoint") or n:find("check") or n == "cp"
+				or n:find("lap") or n:find("start") or n:find("finish")
+				or n:find("gate") or n:find("ring") then
+				table.insert(strict, d)
+			else
+				table.insert(fallback, d)
+			end
+		end
+	end
+	if #strict > 0 then return numericNameSort(strict) end
+	return numericNameSort(fallback)
+end
+
+local function driveCheckpoints(flagKey, runningKey, mode)
 	Flags[flagKey] = true
 	if Flags[runningKey] then return end
 	Flags[runningKey] = true
 	task.spawn(function()
+		local warnedSeat = false
+		local stallN = 0
 		while Flags[flagKey] and not Unloaded do
 			local did = false
 			pcall(function()
 				local races = workspace:FindFirstChild("Races")
-				if races then
-					-- deobfuscated.lua: race toggles drive checkpoints at AutoRaceSpeed
-					local seat = seatOf()
-					if seat and seat:IsA("VehicleSeat") then seat.MaxSpeed = AutoRaceSpeed end
-					for _, cp in ipairs(races:GetDescendants()) do
-						if not Flags[flagKey] or Unloaded then break end
-						if cp:IsA("BasePart") and (cp.Name:lower():find("checkpoint") or cp.Name:lower():find("lap")) then
+				if not races then
+					pcall(function() status:Set("Status: Race - workspace.Races not found") end)
+					return
+				end
+				local roots = {}
+				if SelectedRace and SelectedRace ~= "All" then
+					local one = races:FindFirstChild(SelectedRace)
+					if one then table.insert(roots, one) end
+				else
+					roots = races:GetChildren()
+				end
+				if #roots == 0 then
+					pcall(function() status:Set("Status: Race - no races (use Refresh)") end)
+					return
+				end
+				for _, root in ipairs(roots) do
+					if not Flags[flagKey] or Unloaded then break end
+					local cps = collectRaceParts(root)
+					if #cps == 0 then
+						pcall(function() status:Set("Status: Race - no parts in " .. root.Name) end)
+					else
+						for i, cp in ipairs(cps) do
+							if not Flags[flagKey] or Unloaded then break end
 							did = true
-							moveTo(cp.CFrame)
-							task.wait(0.3)
+							local seat = seatOf()
+							local speed = AutoRaceSpeed * ((mode == "drift") and 1.5 or 1)
+							if seat and seat:IsA("VehicleSeat") then
+								pcall(function() seat.MaxSpeed = speed end)
+							else
+								if not warnedSeat then
+									warnedSeat = true
+									notify("Race: sit in a vehicle for vehicle races")
+								end
+							end
+							pcall(function()
+								status:Set("Status: Race " .. root.Name .. " " .. i .. "/" .. #cps)
+							end)
+							collectTarget(cp, 16)
+							task.wait(mode == "drift" and 0.4 or 0.6)
 						end
 					end
 				end
 			end)
-			if not did then task.wait(1) end
+			if did then stallN = 0 else stallN += 1 end
+			if stallN == 10 then
+				pcall(function() status:Set("Status: Race - waiting for checkpoints...") end)
+			end
+			if not did then task.wait(1.5) end
 		end
+		local seat = seatOf()
+		if seat and seat:IsA("VehicleSeat") then pcall(function() seat.ThrottleFloat = 0 end) end
 		Flags[runningKey] = false
 	end)
 end
 
 RaceTab:AddToggle({
 	Title    = "Auto Race",
-	Subtitle = "Drives race checkpoints",
+	Subtitle = "Uses Target Race below; sit in vehicle",
 	Icon     = "flag",
 	Default  = false,
 	Callback = function(state)
 		report("Auto Race", state)
 		if state then
-			driveCheckpoints("AutoRace", "_raceRunning")
+			driveCheckpoints("AutoRace", "_raceRunning", "race")
 		else
 			Flags.AutoRace = false
 		end
@@ -680,13 +1025,13 @@ RaceTab:AddToggle({
 
 RaceTab:AddToggle({
 	Title    = "Auto Drift Race",
-	Subtitle = "Drift mode",
+	Subtitle = "Faster checkpoints; sit in vehicle",
 	Icon     = "wind",
 	Default  = false,
 	Callback = function(state)
 		report("Auto Drift Race", state)
 		if state then
-			driveCheckpoints("AutoDrift", "_driftRunning")
+			driveCheckpoints("AutoDrift", "_driftRunning", "drift")
 		else
 			Flags.AutoDrift = false
 		end
@@ -695,13 +1040,13 @@ RaceTab:AddToggle({
 
 RaceTab:AddToggle({
 	Title    = "AutoFarm[laps|checkpoints]",
-	Subtitle = "Laps / checkpoints farm",
+	Subtitle = "Loops Target Race checkpoints",
 	Icon     = "repeat",
 	Default  = false,
 	Callback = function(state)
 		report("AutoFarm[laps|checkpoints]", state)
 		if state then
-			driveCheckpoints("AutoLaps", "_lapsRunning")
+			driveCheckpoints("AutoLaps", "_lapsRunning", "laps")
 		else
 			Flags.AutoLaps = false
 		end
@@ -1021,6 +1366,7 @@ SettingsTab:AddButton({
 		Flags.AutoEvent = false
 		Flags.AutoBuy = false
 		if zoomConn then zoomConn:Disconnect() end
+		pcall(function() destroySkyRoad() end)
 		Panel:Destroy()
 		QuickBar:Destroy()
 		Window:Destroy()
