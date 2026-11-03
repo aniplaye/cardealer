@@ -328,7 +328,7 @@ Window = VantixUI:CreateWindow({
 })
 
 Window:CreateTag("Beta", Color3.fromRGB(240, 100, 100), nil, "flask-conical")
-Window:CreateTag("V2.1", Color3.fromRGB(60, 120, 210), nil, "git-branch")
+Window:CreateTag("V2.2", Color3.fromRGB(60, 120, 210), nil, "git-branch")
 
 Window:Notify({
 	Title    = "Vena's private Bypass",
@@ -379,14 +379,26 @@ local function buildSkyRoad()
 		return p
 	end
 	local mid = (s + e) / 2
+	-- road top surface height; everything else is built flush to it
+	local topY = mid.Y + 1
 	mkPart("Road", Vector3.new(SKY.LEN, 2, SKY.WIDTH), CFrame.new(mid), Color3.fromRGB(30, 30, 35))
 	-- low guard rails so you do not slide off sideways (cover the start pad too)
 	local railMid = mid + Vector3.new(6, 0, 0)
 	mkPart("RailL", Vector3.new(SKY.LEN + 18, 6, 1), CFrame.new(railMid + Vector3.new(0, 4, SKY.WIDTH / 2)), Color3.fromRGB(200, 60, 60))
 	mkPart("RailR", Vector3.new(SKY.LEN + 18, 6, 1), CFrame.new(railMid + Vector3.new(0, 4, -SKY.WIDTH / 2)), Color3.fromRGB(200, 60, 60))
-	-- bright start pad, same thickness as the road (flush tops, no lip) and
-	-- overlapping 24 studs into the road so there is no gap to fall through
-	mkPart("StartPad", Vector3.new(30, 2, SKY.WIDTH), CFrame.new(s + Vector3.new(9, 0, 0)), Color3.fromRGB(60, 200, 120))
+	-- giant green platform 1000x1000 under the start of the road.
+	-- top sits 0.1 below the road top: visually the same level, no lip to
+	-- catch on, and no coplanar faces so nothing flickers.
+	local slabC = Vector3.new(s.X + 400, (topY - 0.1) - 2, s.Z)
+	mkPart("StartPad", Vector3.new(1000, 4, 1000), CFrame.new(slabC), Color3.fromRGB(60, 200, 120))
+	-- tall perimeter rails around the slab so fast cars stay on it
+	local px, pz, py = slabC.X, slabC.Z, topY + 5
+	mkPart("SlabN", Vector3.new(1000, 10, 1), CFrame.new(Vector3.new(px, py, pz - 500)), Color3.fromRGB(200, 60, 60))
+	mkPart("SlabS", Vector3.new(1000, 10, 1), CFrame.new(Vector3.new(px, py, pz + 500)), Color3.fromRGB(200, 60, 60))
+	mkPart("SlabW", Vector3.new(1, 10, 1000), CFrame.new(Vector3.new(px - 500, py, pz)), Color3.fromRGB(200, 60, 60))
+	-- east wall split in two so the road (26 wide) exits the slab through a gap
+	mkPart("SlabE1", Vector3.new(1, 10, 487), CFrame.new(Vector3.new(px + 500, py, pz - 256.5)), Color3.fromRGB(200, 60, 60))
+	mkPart("SlabE2", Vector3.new(1, 10, 487), CFrame.new(Vector3.new(px + 500, py, pz + 256.5)), Color3.fromRGB(200, 60, 60))
 	Flags.SkyStart, Flags.SkyEnd, Flags.SkyLaps = s, e, 0
 	return s, e
 end
