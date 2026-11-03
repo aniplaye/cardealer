@@ -328,7 +328,7 @@ Window = VantixUI:CreateWindow({
 })
 
 Window:CreateTag("Beta", Color3.fromRGB(240, 100, 100), nil, "flask-conical")
-Window:CreateTag("V2.2", Color3.fromRGB(60, 120, 210), nil, "git-branch")
+Window:CreateTag("V2.3", Color3.fromRGB(60, 120, 210), nil, "git-branch")
 
 Window:Notify({
 	Title    = "Vena's private Bypass",
@@ -405,7 +405,10 @@ end
 local function skyStartCF()
 	local s = Flags.SkyStart
 	if not s then return nil end
-	local p = s + Vector3.new(0, 6, 0)
+	-- spawn exactly 1 stud above the road top (road top = s.Y + 1), a bit
+	-- forward (+15 X) so the whole car sits on the road clear of the rail
+	-- start edge / pad seam instead of straddling it and catching.
+	local p = s + Vector3.new(15, 2, 0)
 	return CFrame.lookAt(p, p + Vector3.new(1, 0, 0))
 end
 
@@ -433,6 +436,10 @@ local autoDriveBox = MainTab:AddTextBox({
 	Default     = "100",
 	Callback    = function(text)
 		AutoDriveSpeed = tonumber(text) or AutoDriveSpeed
+		if Flags.AutoFarm then
+			notify("Speed box ignored while Auto Farm is on (farm just holds W)")
+			return
+		end
 		local seat = seatOf()
 		if seat and seat:IsA("VehicleSeat") then
 			pcall(function() seat.MaxSpeed = AutoDriveSpeed end)
@@ -442,7 +449,7 @@ local autoDriveBox = MainTab:AddTextBox({
 
 autoFarmToggle = MainTab:AddToggle({
 	Title    = "Auto Farm",
-	Subtitle = "1000-stud sky road, loops at edge",
+	Subtitle = "Sky road, holds W (speed box ignored)",
 	Icon     = "car",
 	Default  = false,
 	Callback = function(state)
@@ -464,11 +471,12 @@ autoFarmToggle = MainTab:AddToggle({
 			local cf = skyStartCF()
 			if cf then moveTo(cf) end
 			task.wait(0.5)
-			notify("Sky road ready - sit in a vehicle to farm")
+			notify("Sky road ready - sit in a vehicle to farm (holds W, speed box ignored)")
 			pcall(function() console:Write("Sky road: " .. tostring(math.floor(s.Y)) .. " studs up, length " .. SKY.LEN) end)
 			local warnedSeat = false
 			local errs = 0
 			local dirX0, dirT0, dirDone = nil, os.clock(), false
+			local stuckX, stuckT = nil, os.clock()
 			while Flags.AutoFarm and not Unloaded do
 				local ok = pcall(function()
 					if not Flags.SkyStart or not Flags.SkyEnd then
@@ -476,9 +484,11 @@ autoFarmToggle = MainTab:AddToggle({
 					end
 					local seat = seatOf()
 					if seat and seat:IsA("VehicleSeat") then
+						-- farm never touches MaxSpeed while on: the car just
+						-- holds W (Throttle = 1), straight ahead, on its own tune.
 						pcall(function()
-							seat.MaxSpeed = AutoDriveSpeed
 							seat.ThrottleFloat = 1
+							seat.SteerFloat = 0
 						end)
 					elseif not warnedSeat then
 						warnedSeat = true
@@ -508,6 +518,36 @@ autoFarmToggle = MainTab:AddToggle({
 									end
 								end
 							end
+						end
+					end
+					local seated = seat and seat:IsA("VehicleSeat")
+					-- grinding a guard rail pushes Z off-center: pull back to
+					-- mid-road (keeps X progress, 1 stud above the top).
+					if seated and Flags.SkyStart and math.abs(pos.Z - Flags.SkyStart.Z) > 8 and not (nearEdge or fell or lost) then
+						local cy = Flags.SkyStart.Y + 2
+						local cz = Flags.SkyStart.Z
+						local cx = pos.X + 2
+						moveTo(CFrame.lookAt(Vector3.new(cx, cy, cz), Vector3.new(cx + 10, cy, cz)))
+						stuckX, stuckT = cx, os.clock()
+						pos = Vector3.new(cx, cy, cz)
+						doneX = pos.X - Flags.SkyStart.X
+					end
+					-- fully stuck (leaning on something, W held but no forward
+					-- motion): lift 1 stud above the top and nudge onward.
+					if seated and not (nearEdge or fell or lost) then
+						if not stuckX then
+							stuckX, stuckT = pos.X, os.clock()
+						elseif (os.clock() - stuckT) > 4 then
+							if pos.X < stuckX + 3 then
+								local cy2 = Flags.SkyStart.Y + 2
+								local cz2 = Flags.SkyStart.Z
+								local cx2 = pos.X + 5
+								moveTo(CFrame.lookAt(Vector3.new(cx2, cy2, cz2), Vector3.new(cx2 + 10, cy2, cz2)))
+								pcall(function() console:Write("Auto Farm: unstuck nudge") end)
+								pos = Vector3.new(cx2, cy2, cz2)
+								doneX = pos.X - Flags.SkyStart.X
+							end
+							stuckX, stuckT = pos.X, os.clock()
 						end
 					end
 					if nearEdge or fell or lost then
