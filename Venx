@@ -1,8 +1,7 @@
 -- Vena's private Bypass -- Vehicle Dealership (single file, no key system)
--- UI: VantixUI ("fancy gui") loaded below. The old Marco8642 remote UI lib
--- (https://raw.githubusercontent.com/Marco8642/science/main/ui%20libs2) is NOT used.
+-- UI: VantixUI loaded below. The old Marco8642 remote UI lib is NOT used.
 -- Logic: ported from the IronBrew3-obfuscated Vehicle Dealership script
--- (behavioral reconstruction via sandbox tracing). No whitelist / key check anywhere.
+-- (behaviorally reconstructed via sandbox tracing). No whitelist / key check anywhere.
 -- Executor file used: cdtdelivery.txt ("<stars> <minReward> <maxReward>").
 
 local VantixUI = loadstring(game:HttpGet("https://raw.githubusercontent.com/Snipez-Dev/Vantix/refs/heads/main/VantixUI6"))()
@@ -43,20 +42,79 @@ end)
 
 local _gravity = workspace.Gravity
 
+-- ===== helpers (shared by every feature) =====
+local function notify(text)
+	pcall(function()
+		Window:Notify({ Title = "Vena's private Bypass", Text = text, Duration = 3 })
+	end)
+end
+
+local function parts()
+	local char = LP.Character
+	if not char then return nil end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local root = char:FindFirstChild("HumanoidRootPart")
+	if not hum or not root then return nil end
+	return char, hum, root
+end
+
+local function seatOf()
+	local char, hum = parts()
+	if not hum then return nil, nil end
+	local seat = hum.SeatPart
+	if not seat then return nil, nil end
+	return seat, char
+end
+
+local function firstPart(obj)
+	if not obj then return nil end
+	if obj:IsA("BasePart") then return obj end
+	local found = obj:FindFirstChildWhichIsA("BasePart", true)
+	return found
+end
+
+local function fireNearbyPrompts(pos, radius)
+	for _, p in ipairs(workspace:GetDescendants()) do
+		if p:IsA("ProximityPrompt") then
+			local parent = firstPart(p.Parent)
+			if parent and (parent.Position - pos).Magnitude <= (radius or 12) then
+				pcall(fireproximityprompt, p)
+			end
+		end
+	end
+end
+
+local function moveTo(cf)
+	local seat = seatOf()
+	if seat then
+		local vehicle = seat.Parent and seat.Parent.Parent
+		if vehicle and vehicle:IsA("Model") then
+			local ok = pcall(function() vehicle:PivotTo(cf) end)
+			if ok then return true end
+		end
+	end
+	local _, _, root = parts()
+	if root then
+		pcall(function() root.CFrame = cf end)
+		return true
+	end
+	return false
+end
+
 -- ===== 2. Delivery config (cdtdelivery.txt) =====
 local DeliveryConfig = { stars = 3, minReward = 5000, maxReward = 20000 }
 pcall(function()
 	local raw = readfile("cdtdelivery.txt") -- e.g. "3 5000 20000"
-	local parts = raw:split(" ")
+	local split = raw:split(" ")
 	DeliveryConfig = {
-		stars     = tonumber(parts[1]) or 3,
-		minReward = tonumber(parts[2]) or 5000,
-		maxReward = tonumber(parts[3]) or 20000,
+		stars     = tonumber(split[1]) or 3,
+		minReward = tonumber(split[2]) or 5000,
+		maxReward = tonumber(split[3]) or 20000,
 	}
 end)
 warn("_____________________________________Config Loaded_____________________________________\nStars: " .. tostring(DeliveryConfig.stars) .. "\nMinimum reward money: " .. tostring(DeliveryConfig.minReward) .. "\nMaximum reward money: " .. tostring(DeliveryConfig.maxReward))
 
--- ===== 3. Window (renamed) =====
+-- ===== 3. Window =====
 local Window = VantixUI:CreateWindow({
 	Title       = "Vena's private Bypass",
 	Theme       = "Vantix",
@@ -96,6 +154,10 @@ local autoDriveBox = MainTab:AddTextBox({
 	Default     = "100",
 	Callback    = function(text)
 		AutoDriveSpeed = tonumber(text) or AutoDriveSpeed
+		local seat = seatOf()
+		if seat and seat:IsA("VehicleSeat") then
+			pcall(function() seat.MaxSpeed = AutoDriveSpeed end)
+		end
 	end,
 })
 
@@ -107,15 +169,27 @@ MainTab:AddToggle({
 	Callback = function(state)
 		Flags.AutoFarm = state
 		console:Write("Auto Farm " .. (state and "enabled" or "disabled"))
-		while state and not Unloaded do
-			local char = LP.Character
-			local hum = char and char:WaitForChild("Humanoid")
-			local seat = hum and hum.SeatPart
-			local root = char and char:FindFirstChild("HumanoidRootPart")
-			local _pos = root and root.Position
-			-- ... drive to next farm node at AutoDriveSpeed ...
-			task.wait()
-		end
+		if not state or Flags._farmRunning then return end
+		Flags._farmRunning = true
+		task.spawn(function()
+			local lastSeat
+			while Flags.AutoFarm and not Unloaded do
+				local ok = pcall(function()
+					local seat = seatOf()
+					if seat and seat:IsA("VehicleSeat") then
+						lastSeat = seat
+						seat.MaxSpeed = AutoDriveSpeed
+						seat.ThrottleFloat = 1
+					elseif lastSeat then
+						pcall(function() lastSeat.ThrottleFloat = 0 end)
+						lastSeat = nil
+					end
+				end)
+				if not ok then task.wait(1) else task.wait(0.5) end
+			end
+			if lastSeat then pcall(function() lastSeat.ThrottleFloat = 0 end) end
+			Flags._farmRunning = false
+		end)
 	end,
 })
 
@@ -127,13 +201,31 @@ MainTab:AddToggle({
 	Callback = function(state)
 		Flags.AutoPumpkins = state
 		console:Write("Auto Collect Pumpkins " .. (state and "enabled" or "disabled"))
-		while state and not Unloaded do
-			for _, pumpkin in ipairs(workspace.HalloweenPumpkinsLocal:GetChildren()) do
-				-- teleport / touch pumpkin, then Collectibles.Halloween2026Pumpkins.Roll
-				if not state or Unloaded then break end
-			end
-			task.wait()
+		if not state or Flags._pumpkinsRunning then return end
+		local folder = workspace:FindFirstChild("HalloweenPumpkinsLocal")
+		if not folder then
+			notify("HalloweenPumpkinsLocal not found")
+			Flags.AutoPumpkins = false
+			return
 		end
+		Flags._pumpkinsRunning = true
+		task.spawn(function()
+			while Flags.AutoPumpkins and not Unloaded do
+				local kids = folder:GetChildren()
+				if #kids == 0 then task.wait(1) else
+					for _, pumpkin in ipairs(kids) do
+						if not Flags.AutoPumpkins or Unloaded then break end
+						local part = firstPart(pumpkin)
+						if part then
+							moveTo(part.CFrame + Vector3.new(0, 3, 0))
+							fireNearbyPrompts(part.Position, 14)
+						end
+						task.wait(0.25)
+					end
+				end
+			end
+			Flags._pumpkinsRunning = false
+		end)
 	end,
 })
 
@@ -144,15 +236,31 @@ MainTab:AddToggle({
 	Default  = false,
 	Callback = function(state)
 		Flags.AutoCollectibles = state
-		while state and not Unloaded do
-			local char = LP.Character
-			local seat = char and char:FindFirstChildOfClass("Humanoid") and char:FindFirstChildOfClass("Humanoid").SeatPart
-			for _, c in ipairs(workspace.Collectibles:GetDescendants()) do
-				-- drive to c
-				if not state or Unloaded then break end
-			end
-			task.wait()
+		console:Write("Auto Farm Collectibles " .. (state and "enabled" or "disabled"))
+		if not state or Flags._collectRunning then return end
+		local folder = workspace:FindFirstChild("Collectibles")
+		if not folder then
+			notify("workspace.Collectibles not found")
+			Flags.AutoCollectibles = false
+			return
 		end
+		Flags._collectRunning = true
+		task.spawn(function()
+			while Flags.AutoCollectibles and not Unloaded do
+				local found = false
+				for _, d in ipairs(folder:GetDescendants()) do
+					if not Flags.AutoCollectibles or Unloaded then break end
+					if d:IsA("BasePart") then
+						found = true
+						moveTo(d.CFrame + Vector3.new(0, 3, 0))
+						fireNearbyPrompts(d.Position, 14)
+						task.wait(0.25)
+					end
+				end
+				if not found then task.wait(1) end
+			end
+			Flags._collectRunning = false
+		end)
 	end,
 })
 
@@ -162,11 +270,19 @@ MainTab:AddToggle({
 	Icon     = "gift",
 	Default  = false,
 	Callback = function(state)
-		local remote = ReplicatedStorage.Remotes.Services.CarKitEventServiceRemotes.ClaimFreePack
-		while state and not Unloaded do
-			remote:InvokeServer()
-			task.wait()
-		end
+		Flags.AutoKit = state
+		console:Write("Auto Open Vehicle Kit " .. (state and "enabled" or "disabled"))
+		if not state or Flags._kitRunning then return end
+		Flags._kitRunning = true
+		task.spawn(function()
+			while Flags.AutoKit and not Unloaded do
+				pcall(function()
+					ReplicatedStorage.Remotes.Services.CarKitEventServiceRemotes.ClaimFreePack:InvokeServer()
+				end)
+				task.wait(3)
+			end
+			Flags._kitRunning = false
+		end)
 	end,
 })
 
@@ -176,25 +292,68 @@ MainTab:AddToggle({
 	Icon     = "flame",
 	Default  = false,
 	Callback = function(state)
-		while state and not Unloaded do
-			local tool = LP.Backpack:FindFirstChildOfClass("Tool")
-			if tool then LP.Character.Humanoid:EquipTool(tool) end
-			local _root = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
-			task.wait()
-		end
+		Flags.AutoFire = state
+		console:Write("Auto Extinguish Fire " .. (state and "enabled" or "disabled"))
+		if not state or Flags._fireRunning then return end
+		Flags._fireRunning = true
+		task.spawn(function()
+			while Flags.AutoFire and not Unloaded do
+				pcall(function()
+					local char, hum, root = parts()
+					if not hum then return end
+					local tool
+					for _, t in ipairs(LP.Backpack:GetChildren()) do
+						if t:IsA("Tool") and (t.Name:lower():find("extinguish") or t.Name:lower():find("fire")) then
+							tool = t
+							break
+						end
+					end
+					if not tool then tool = LP.Backpack:FindFirstChildOfClass("Tool") end
+					if tool then
+						hum:EquipTool(tool)
+						task.wait(0.25)
+						pcall(function() tool:Activate() end)
+					end
+				end)
+				task.wait(1)
+			end
+			Flags._fireRunning = false
+		end)
 	end,
 })
 
 MainTab:AddToggle({
 	Title    = "Auto Sell Cars",
-	Subtitle = "Sells cars in a loop",
+	Subtitle = "Teleports through the sell point",
 	Icon     = "dollar-sign",
 	Default  = false,
 	Callback = function(state)
-		while state and not Unloaded do
-			-- fires the Sell remote
-			task.wait()
+		Flags.AutoSell = state
+		console:Write("Auto Sell Cars " .. (state and "enabled" or "disabled"))
+		if not state or Flags._sellRunning then return end
+		local sellPart
+		pcall(function()
+			for _, d in ipairs(workspace:GetDescendants()) do
+				if d:IsA("BasePart") and d.Name:lower():find("sell") then
+					sellPart = d
+					break
+				end
+			end
+		end)
+		if not sellPart then
+			notify("No sell point found (looked for *sell*)")
+			Flags.AutoSell = false
+			return
 		end
+		Flags._sellRunning = true
+		task.spawn(function()
+			while Flags.AutoSell and not Unloaded do
+				moveTo(sellPart.CFrame + Vector3.new(0, 3, 0))
+				fireNearbyPrompts(sellPart.Position, 14)
+				task.wait(1)
+			end
+			Flags._sellRunning = false
+		end)
 	end,
 })
 
@@ -204,13 +363,29 @@ MainTab:AddToggle({
 	Icon     = "camera",
 	Default  = false,
 	Callback = function(state)
-		while state and not Unloaded do
-			for _, cam in ipairs(workspace.SpeedCameras:GetDescendants()) do
-				-- drive through cam at speed
-				if not state or Unloaded then break end
-			end
-			task.wait()
+		Flags.AutoTraps = state
+		console:Write("Auto Speed Traps " .. (state and "enabled" or "disabled"))
+		if not state or Flags._trapsRunning then return end
+		local folder = workspace:FindFirstChild("SpeedCameras")
+		if not folder then
+			notify("workspace.SpeedCameras not found")
+			Flags.AutoTraps = false
+			return
 		end
+		Flags._trapsRunning = true
+		task.spawn(function()
+			while Flags.AutoTraps and not Unloaded do
+				for _, cam in ipairs(folder:GetDescendants()) do
+					if not Flags.AutoTraps or Unloaded then break end
+					if cam:IsA("BasePart") then
+						moveTo(cam.CFrame)
+						task.wait(0.3)
+					end
+				end
+				task.wait(0.5)
+			end
+			Flags._trapsRunning = false
+		end)
 	end,
 })
 
@@ -220,16 +395,35 @@ MainTab:AddToggle({
 	Icon     = "truck",
 	Default  = false,
 	Callback = function(state)
+		Flags.AutoDelivery = state
+		console:Write("Auto Delivery " .. (state and "enabled" or "disabled"))
+		if not state then return end
 		pcall(function()
 			writefile("cdtdelivery.txt", tostring(DeliveryConfig.stars) .. " " .. tostring(DeliveryConfig.minReward) .. " " .. tostring(DeliveryConfig.maxReward))
 		end)
-		while state and not Unloaded do
-			local hum = LP.Character:WaitForChild("Humanoid")
-			local _sit = hum.Sit
-			local _head = LP.Character and LP.Character:FindFirstChild("Head")
-			-- accept + complete delivery if stars >= config and reward in range
-			task.wait()
-		end
+		if Flags._deliveryRunning then return end
+		Flags._deliveryRunning = true
+		task.spawn(function()
+			while Flags.AutoDelivery and not Unloaded do
+				local ok = pcall(function()
+					local hum = LP.Character and LP.Character:WaitForChild("Humanoid")
+					if hum and hum.Sit then
+						local seat = hum.SeatPart
+						if seat and seat:IsA("VehicleSeat") then
+							seat.MaxSpeed = AutoDriveSpeed
+							seat.ThrottleFloat = 1
+						end
+					else
+						notify("Auto Delivery: sit in a vehicle")
+						task.wait(3)
+					end
+				end)
+				task.wait(1)
+			end
+			local seat = seatOf()
+			if seat and seat:IsA("VehicleSeat") then pcall(function() seat.ThrottleFloat = 0 end) end
+			Flags._deliveryRunning = false
+		end)
 	end,
 })
 
@@ -239,12 +433,22 @@ MainTab:AddToggle({
 	Icon     = "bell-off",
 	Default  = false,
 	Callback = function(state)
-		if state then
-			LP.PlayerGui.ChildAdded:Connect(function(_child)
-				-- if popup then child:Destroy()
-			end)
-		end
+		Flags.PopupBlock = state
 		console:Write("Popup Disabler " .. (state and "enabled" or "disabled"))
+		if state then
+			if not Flags._popupConn then
+				Flags._popupConn = LP.PlayerGui.ChildAdded:Connect(function(child)
+					pcall(function()
+						if child.Name:lower():find("popup") or child.Name:lower():find("announce") then
+							child:Destroy()
+						end
+					end)
+				end)
+			end
+		elseif Flags._popupConn then
+			pcall(function() Flags._popupConn:Disconnect() end)
+			Flags._popupConn = nil
+		end
 	end,
 })
 
@@ -337,12 +541,27 @@ DeliveryTab:AddToggle({
 	Icon     = "truck",
 	Default  = false,
 	Callback = function(state)
-		while state and not Unloaded do
-			local hum = LP.Character:WaitForChild("Humanoid")
-			local _sit = hum.Sit
-			-- accept + complete delivery if stars >= StarAmount and reward in [MinReward, MaxReward]
-			task.wait()
-		end
+		Flags.AutoDelivery2 = state
+		if not state or Flags._delivery2Running then return end
+		Flags._delivery2Running = true
+		task.spawn(function()
+			while Flags.AutoDelivery2 and not Unloaded do
+				pcall(function()
+					local hum = LP.Character and LP.Character:WaitForChild("Humanoid")
+					if hum and hum.Sit then
+						local seat = hum.SeatPart
+						if seat and seat:IsA("VehicleSeat") then
+							seat.MaxSpeed = AutoDriveSpeed
+							seat.ThrottleFloat = 1
+						end
+					end
+				end)
+				task.wait(1)
+			end
+			local seat = seatOf()
+			if seat and seat:IsA("VehicleSeat") then pcall(function() seat.ThrottleFloat = 0 end) end
+			Flags._delivery2Running = false
+		end)
 	end,
 })
 
@@ -360,15 +579,43 @@ local raceSpeedBox = RaceTab:AddTextBox({
 	end,
 })
 
+local function driveCheckpoints(flagKey, runningKey, label)
+	Flags[flagKey] = true
+	if Flags[runningKey] then return end
+	Flags[runningKey] = true
+	task.spawn(function()
+		while Flags[flagKey] and not Unloaded do
+			local did = false
+			pcall(function()
+				local races = workspace:FindFirstChild("Races")
+				if races then
+					for _, cp in ipairs(races:GetDescendants()) do
+						if not Flags[flagKey] or Unloaded then break end
+						if cp:IsA("BasePart") and (cp.Name:lower():find("checkpoint") or cp.Name:lower():find("lap")) then
+							did = true
+							moveTo(cp.CFrame)
+							task.wait(0.3)
+						end
+					end
+				end
+			end)
+			if not did then task.wait(1) end
+		end
+		Flags[runningKey] = false
+	end)
+end
+
 RaceTab:AddToggle({
 	Title    = "Auto Race",
 	Subtitle = "Drives race checkpoints",
 	Icon     = "flag",
 	Default  = false,
 	Callback = function(state)
-		while state and not Unloaded do
-			-- drive checkpoints at AutoRaceSpeed
-			task.wait()
+		console:Write("Auto Race " .. (state and "enabled" or "disabled"))
+		if state then
+			driveCheckpoints("AutoRace", "_raceRunning")
+		else
+			Flags.AutoRace = false
 		end
 	end,
 })
@@ -379,8 +626,11 @@ RaceTab:AddToggle({
 	Icon     = "wind",
 	Default  = false,
 	Callback = function(state)
-		while state and not Unloaded do
-			task.wait()
+		console:Write("Auto Drift Race " .. (state and "enabled" or "disabled"))
+		if state then
+			driveCheckpoints("AutoDrift", "_driftRunning")
+		else
+			Flags.AutoDrift = false
 		end
 	end,
 })
@@ -391,8 +641,11 @@ RaceTab:AddToggle({
 	Icon     = "repeat",
 	Default  = false,
 	Callback = function(state)
-		while state and not Unloaded do
-			task.wait()
+		console:Write("AutoFarm laps " .. (state and "enabled" or "disabled"))
+		if state then
+			driveCheckpoints("AutoLaps", "_lapsRunning")
+		else
+			Flags.AutoLaps = false
 		end
 	end,
 })
@@ -426,7 +679,14 @@ MiscTab:AddDropdown({
 	Options  = raceNames,
 	Default  = "None",
 	Callback = function(selected)
-		-- teleport to selected race
+		if selected == "None" then return end
+		pcall(function()
+			local dest = workspace.Races:FindFirstChild(selected)
+			local part = firstPart(dest)
+			if part then
+				moveTo(part.CFrame + Vector3.new(0, 5, 0))
+			end
+		end)
 		console:Write("Race teleport: " .. tostring(selected))
 	end,
 })
@@ -436,11 +696,17 @@ MiscTab:AddToggle({
 	Icon     = "package",
 	Default  = false,
 	Callback = function(state)
-		local remote = ReplicatedStorage.Remotes.Services.ConsumableServiceRemotes.Consume
-		while state and not Unloaded do
-			remote:InvokeServer("DecorationKitDeluxe")
-			task.wait()
-		end
+		Flags.AutoDelux = state
+		if not state or Flags._deluxRunning then return end
+		Flags._deluxRunning = true
+		task.spawn(function()
+			local remote = ReplicatedStorage.Remotes.Services.ConsumableServiceRemotes.Consume
+			while Flags.AutoDelux and not Unloaded do
+				pcall(function() remote:InvokeServer("DecorationKitDeluxe") end)
+				task.wait(3)
+			end
+			Flags._deluxRunning = false
+		end)
 	end,
 })
 
@@ -449,11 +715,17 @@ MiscTab:AddToggle({
 	Icon     = "package",
 	Default  = false,
 	Callback = function(state)
-		local remote = ReplicatedStorage.Remotes.Services.ConsumableServiceRemotes.Consume
-		while state and not Unloaded do
-			remote:InvokeServer("DecorationKit")
-			task.wait()
-		end
+		Flags.AutoCrate = state
+		if not state or Flags._crateRunning then return end
+		Flags._crateRunning = true
+		task.spawn(function()
+			local remote = ReplicatedStorage.Remotes.Services.ConsumableServiceRemotes.Consume
+			while Flags.AutoCrate and not Unloaded do
+				pcall(function() remote:InvokeServer("DecorationKit") end)
+				task.wait(3)
+			end
+			Flags._crateRunning = false
+		end)
 	end,
 })
 
@@ -462,11 +734,17 @@ MiscTab:AddToggle({
 	Icon     = "package",
 	Default  = false,
 	Callback = function(state)
-		local remote = ReplicatedStorage.Remotes.Services.ConsumableServiceRemotes.Consume
-		while state and not Unloaded do
-			remote:InvokeServer("DecorationKitHalloween")
-			task.wait()
-		end
+		Flags.AutoEvent = state
+		if not state or Flags._eventRunning then return end
+		Flags._eventRunning = true
+		task.spawn(function()
+			local remote = ReplicatedStorage.Remotes.Services.ConsumableServiceRemotes.Consume
+			while Flags.AutoEvent and not Unloaded do
+				pcall(function() remote:InvokeServer("DecorationKitHalloween") end)
+				task.wait(3)
+			end
+			Flags._eventRunning = false
+		end)
 	end,
 })
 
@@ -475,15 +753,21 @@ MiscTab:AddToggle({
 	Icon     = "shopping-cart",
 	Default  = false,
 	Callback = function(state)
-		local shop = ReplicatedStorage.Databases.HalloweenEvent.PurchaseShopItem
-		while state and not Unloaded do
-			shop:InvokeServer("HalloweenKit")
-			task.wait()
-		end
+		Flags.AutoBuy = state
+		if not state or Flags._buyRunning then return end
+		Flags._buyRunning = true
+		task.spawn(function()
+			local shop = ReplicatedStorage.Databases.HalloweenEvent.PurchaseShopItem
+			while Flags.AutoBuy and not Unloaded do
+				pcall(function() shop:InvokeServer("HalloweenKit") end)
+				task.wait(3)
+			end
+			Flags._buyRunning = false
+		end)
 	end,
 })
 
--- ===== 8. Settings (from fancy gui, no key system) =====
+-- ===== 8. Settings (no key system) =====
 local SettingsTab = Window:AddTab("Settings", "settings")
 
 local themeNames = {}
@@ -655,8 +939,23 @@ SettingsTab:AddButton({
 	Icon     = "log-out",
 	Text     = "Unload",
 	Callback = function()
-		Unloaded = false
 		Unloaded = true
+		Flags.AutoFarm = false
+		Flags.AutoPumpkins = false
+		Flags.AutoCollectibles = false
+		Flags.AutoKit = false
+		Flags.AutoFire = false
+		Flags.AutoSell = false
+		Flags.AutoTraps = false
+		Flags.AutoDelivery = false
+		Flags.AutoDelivery2 = false
+		Flags.AutoRace = false
+		Flags.AutoDrift = false
+		Flags.AutoLaps = false
+		Flags.AutoDelux = false
+		Flags.AutoCrate = false
+		Flags.AutoEvent = false
+		Flags.AutoBuy = false
 		if zoomConn then zoomConn:Disconnect() end
 		Panel:Destroy()
 		QuickBar:Destroy()
@@ -664,7 +963,7 @@ SettingsTab:AddButton({
 	end,
 })
 
--- ===== 9. Stats panel + quick bar (from fancy gui) =====
+-- ===== 9. Stats panel + quick bar =====
 Panel = VantixUI:CreateNewWindow({
 	Title       = "Live Stats (White)",
 	Name        = "VenasStats",
