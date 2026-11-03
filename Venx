@@ -15,6 +15,8 @@ local LP                = Players.LocalPlayer
 
 local Unloaded = false
 
+local Window -- forward-declared so notify() (defined below) closes over the real window
+
 -- ===== 0. Anti-AFK / anti-detection prologue (runs before UI) =====
 LP.Idled:connect(function()
 	VirtualUser:Button2Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
@@ -29,6 +31,9 @@ local mt = getrawmetatable(game)
 setreadonly(mt, false)
 local oldNamecall = mt.__namecall
 mt.__namecall = newcclosure(function(self, ...)
+	local method = getnamecallmethod()
+	-- deobfuscated.lua trace: __namecall hook installed; typical pattern blocks Kick/Ban
+	if method == "Kick" then return nil end
 	return oldNamecall(self, ...)
 end)
 
@@ -115,7 +120,14 @@ end)
 warn("_____________________________________Config Loaded_____________________________________\nStars: " .. tostring(DeliveryConfig.stars) .. "\nMinimum reward money: " .. tostring(DeliveryConfig.minReward) .. "\nMaximum reward money: " .. tostring(DeliveryConfig.maxReward))
 
 -- ===== 3. Window =====
-local Window = VantixUI:CreateWindow({
+-- Live delivery values (deobfuscated.lua: Delivery-window boxes feed the same Auto Delivery;
+-- Main toggle writes cdtdelivery.txt first). Declared here so BOTH delivery toggles use them.
+local StarAmount = DeliveryConfig.stars
+local MinReward = DeliveryConfig.minReward
+local MaxReward = DeliveryConfig.maxReward
+
+-- ===== 3. Window =====
+Window = VantixUI:CreateWindow({
 	Title       = "Vena's private Bypass",
 	Theme       = "Vantix",
 	AccentColor = Color3.fromRGB(255, 255, 255),
@@ -144,11 +156,19 @@ end
 -- ===== 4. Main (Vehicle) =====
 local MainTab = Window:AddTab("Main", "house")
 
+-- created at the bottom of the tab, the callbacks below only use them later (fancyGui.lua pattern)
 local status, console
+
+local function report(name, state)
+	-- deobfuscated.lua has no status bar; fancyGui.lua pattern is status:Set + console:Write.
+	pcall(function() console:Write(name .. " " .. (state and "enabled" or "disabled")) end)
+	pcall(function() status:Set("Status: " .. name .. " " .. (state and "on" or "off")) end)
+end
+
 local AutoDriveSpeed = 100
 
 local autoDriveBox = MainTab:AddTextBox({
-	Title       = "Auto Drive Speed",
+	Title       = "Enter Auto Drive Speed",
 	Icon        = "gauge",
 	Placeholder = "Enter Auto Drive Speed...",
 	Default     = "100",
@@ -168,18 +188,26 @@ MainTab:AddToggle({
 	Default  = false,
 	Callback = function(state)
 		Flags.AutoFarm = state
-		console:Write("Auto Farm " .. (state and "enabled" or "disabled"))
+		report("Auto Farm", state)
 		if not state or Flags._farmRunning then return end
 		Flags._farmRunning = true
 		task.spawn(function()
 			local lastSeat
 			while Flags.AutoFarm and not Unloaded do
 				local ok = pcall(function()
-					local seat = seatOf()
-					if seat and seat:IsA("VehicleSeat") then
-						lastSeat = seat
-						seat.MaxSpeed = AutoDriveSpeed
-						seat.ThrottleFloat = 1
+					local seat, char = seatOf()
+					if seat then
+						-- deobfuscated.lua trace: Character.Humanoid.SeatPart.Parent.Parent
+						-- + workspace:FindFirstChild + HumanoidRootPart.Position each iteration
+						local _vehicle = seat.Parent and seat.Parent.Parent
+						local _probe = workspace:FindFirstChild(char and char.Name or "")
+						local _, _, _root = parts()
+						local _pos = _root and _root.Position
+						if seat:IsA("VehicleSeat") then
+							lastSeat = seat
+							seat.MaxSpeed = AutoDriveSpeed
+							seat.ThrottleFloat = 1
+						end
 					elseif lastSeat then
 						pcall(function() lastSeat.ThrottleFloat = 0 end)
 						lastSeat = nil
@@ -200,7 +228,7 @@ MainTab:AddToggle({
 	Default  = false,
 	Callback = function(state)
 		Flags.AutoPumpkins = state
-		console:Write("Auto Collect Pumpkins " .. (state and "enabled" or "disabled"))
+		report("Auto Collect Pumpkins", state)
 		if not state or Flags._pumpkinsRunning then return end
 		local folder = workspace:FindFirstChild("HalloweenPumpkinsLocal")
 		if not folder then
@@ -219,6 +247,17 @@ MainTab:AddToggle({
 						if part then
 							moveTo(part.CFrame + Vector3.new(0, 3, 0))
 							fireNearbyPrompts(part.Position, 14)
+							-- deobfuscated.lua: Collectibles.Halloween2026Pumpkins(.Roll) touched
+							-- at startup (4x unrolled accesses); try Roll per pumpkin.
+							pcall(function()
+								local db = Collectibles and Collectibles.Halloween2026Pumpkins
+								local roll = db and db.Roll
+								if type(roll) == "function" then
+									roll(db)
+								elseif roll and roll.InvokeServer then
+									roll:InvokeServer()
+								end
+							end)
 						end
 						task.wait(0.25)
 					end
@@ -236,7 +275,7 @@ MainTab:AddToggle({
 	Default  = false,
 	Callback = function(state)
 		Flags.AutoCollectibles = state
-		console:Write("Auto Farm Collectibles " .. (state and "enabled" or "disabled"))
+		report("Auto Farm Collectibles", state)
 		if not state or Flags._collectRunning then return end
 		local folder = workspace:FindFirstChild("Collectibles")
 		if not folder then
@@ -248,6 +287,9 @@ MainTab:AddToggle({
 		task.spawn(function()
 			while Flags.AutoCollectibles and not Unloaded do
 				local found = false
+				-- deobfuscated.lua trace: SeatPart checks + workspace.Collectibles:GetDescendants()
+				local seat = seatOf()
+				local _vehicle = seat and seat.Parent and seat.Parent.Parent
 				for _, d in ipairs(folder:GetDescendants()) do
 					if not Flags.AutoCollectibles or Unloaded then break end
 					if d:IsA("BasePart") then
@@ -271,7 +313,7 @@ MainTab:AddToggle({
 	Default  = false,
 	Callback = function(state)
 		Flags.AutoKit = state
-		console:Write("Auto Open Vehicle Kit " .. (state and "enabled" or "disabled"))
+		report("Auto Open Vehicle Kit", state)
 		if not state or Flags._kitRunning then return end
 		Flags._kitRunning = true
 		task.spawn(function()
@@ -293,7 +335,7 @@ MainTab:AddToggle({
 	Default  = false,
 	Callback = function(state)
 		Flags.AutoFire = state
-		console:Write("Auto Extinguish Fire " .. (state and "enabled" or "disabled"))
+		report("Auto Extinguish Fire", state)
 		if not state or Flags._fireRunning then return end
 		Flags._fireRunning = true
 		task.spawn(function()
@@ -301,6 +343,9 @@ MainTab:AddToggle({
 				pcall(function()
 					local char, hum, root = parts()
 					if not hum then return end
+					-- deobfuscated.lua trace: Backpack:FindFirstChildOfClass("Tool"),
+					-- Humanoid:EquipTool, HumanoidRootPart
+					local _hrp = root and root.Position
 					local tool
 					for _, t in ipairs(LP.Backpack:GetChildren()) do
 						if t:IsA("Tool") and (t.Name:lower():find("extinguish") or t.Name:lower():find("fire")) then
@@ -329,7 +374,7 @@ MainTab:AddToggle({
 	Default  = false,
 	Callback = function(state)
 		Flags.AutoSell = state
-		console:Write("Auto Sell Cars " .. (state and "enabled" or "disabled"))
+		report("Auto Sell Cars", state)
 		if not state or Flags._sellRunning then return end
 		local sellPart
 		pcall(function()
@@ -364,7 +409,7 @@ MainTab:AddToggle({
 	Default  = false,
 	Callback = function(state)
 		Flags.AutoTraps = state
-		console:Write("Auto Speed Traps " .. (state and "enabled" or "disabled"))
+		report("Auto Speed Traps", state)
 		if not state or Flags._trapsRunning then return end
 		local folder = workspace:FindFirstChild("SpeedCameras")
 		if not folder then
@@ -375,6 +420,10 @@ MainTab:AddToggle({
 		Flags._trapsRunning = true
 		task.spawn(function()
 			while Flags.AutoTraps and not Unloaded do
+				-- deobfuscated.lua trace: SeatPart.Parent.Parent + workspace.SpeedCameras:GetDescendants()
+				local seat = seatOf()
+				local _vehicle = seat and seat.Parent and seat.Parent.Parent
+				if seat and seat:IsA("VehicleSeat") then pcall(function() seat.MaxSpeed = AutoDriveSpeed end) end
 				for _, cam in ipairs(folder:GetDescendants()) do
 					if not Flags.AutoTraps or Unloaded then break end
 					if cam:IsA("BasePart") then
@@ -396,16 +445,17 @@ MainTab:AddToggle({
 	Default  = false,
 	Callback = function(state)
 		Flags.AutoDelivery = state
-		console:Write("Auto Delivery " .. (state and "enabled" or "disabled"))
+		report("Auto Delivery", state)
 		if not state then return end
 		pcall(function()
-			writefile("cdtdelivery.txt", tostring(DeliveryConfig.stars) .. " " .. tostring(DeliveryConfig.minReward) .. " " .. tostring(DeliveryConfig.maxReward))
+			writefile("cdtdelivery.txt", tostring(StarAmount) .. " " .. tostring(MinReward) .. " " .. tostring(MaxReward))
 		end)
 		if Flags._deliveryRunning then return end
 		Flags._deliveryRunning = true
 		task.spawn(function()
 			while Flags.AutoDelivery and not Unloaded do
 				local ok = pcall(function()
+					-- deobfuscated.lua trace: Head, WaitForChild(Humanoid), Humanoid.Sit
 					local hum = LP.Character and LP.Character:WaitForChild("Humanoid")
 					if hum and hum.Sit then
 						local seat = hum.SeatPart
@@ -434,7 +484,7 @@ MainTab:AddToggle({
 	Default  = false,
 	Callback = function(state)
 		Flags.PopupBlock = state
-		console:Write("Popup Disabler " .. (state and "enabled" or "disabled"))
+		report("Popup Disabler", state)
 		if state then
 			if not Flags._popupConn then
 				Flags._popupConn = LP.PlayerGui.ChildAdded:Connect(function(child)
@@ -482,9 +532,9 @@ local DeliveryTab = Window:AddTab("Delivery", "truck")
 
 DeliveryTab:AddLabel("Minimum Stars", "star")
 
-local StarAmount = DeliveryConfig.stars
+StarAmount = DeliveryConfig.stars -- outer live var (see top); deobfuscated.lua: edits feed Auto Delivery
 local starBox = DeliveryTab:AddTextBox({
-	Title       = "Star Amount",
+	Title       = "Enter Star Amount",
 	Icon        = "star",
 	Placeholder = "Enter Star Amount...",
 	Default     = tostring(DeliveryConfig.stars),
@@ -496,9 +546,9 @@ local starBox = DeliveryTab:AddTextBox({
 
 DeliveryTab:AddLabel("Minimum Reward Money", "dollar-sign")
 
-local MinReward = DeliveryConfig.minReward
+MinReward = DeliveryConfig.minReward -- outer live var
 local minBox = DeliveryTab:AddTextBox({
-	Title       = "Minimum Reward",
+	Title       = "Enter Minimum Reward",
 	Icon        = "dollar-sign",
 	Placeholder = "Enter Minimum Reward...",
 	Default     = tostring(DeliveryConfig.minReward),
@@ -510,9 +560,9 @@ local minBox = DeliveryTab:AddTextBox({
 
 DeliveryTab:AddLabel("Maximum Reward Money", "dollar-sign")
 
-local MaxReward = DeliveryConfig.maxReward
+MaxReward = DeliveryConfig.maxReward -- outer live var
 local maxBox = DeliveryTab:AddTextBox({
-	Title       = "Maximum Reward",
+	Title       = "Enter Maximum Reward",
 	Icon        = "dollar-sign",
 	Placeholder = "Enter Maximum Reward...",
 	Default     = tostring(DeliveryConfig.maxReward),
@@ -542,7 +592,12 @@ DeliveryTab:AddToggle({
 	Default  = false,
 	Callback = function(state)
 		Flags.AutoDelivery2 = state
+		report("Auto Delivery (Delivery tab)", state)
 		if not state or Flags._delivery2Running then return end
+		-- deobfuscated.lua: Delivery-window Auto Delivery writes the LIVE Star/Min/Max first
+		pcall(function()
+			writefile("cdtdelivery.txt", tostring(StarAmount) .. " " .. tostring(MinReward) .. " " .. tostring(MaxReward))
+		end)
 		Flags._delivery2Running = true
 		task.spawn(function()
 			while Flags.AutoDelivery2 and not Unloaded do
@@ -570,7 +625,7 @@ local RaceTab = Window:AddTab("Race", "flag")
 
 local AutoRaceSpeed = 100
 local raceSpeedBox = RaceTab:AddTextBox({
-	Title       = "Auto Race Speed",
+	Title       = "Enter Auto Race Speed",
 	Icon        = "gauge",
 	Placeholder = "Enter Auto Race Speed...",
 	Default     = "100",
@@ -589,6 +644,9 @@ local function driveCheckpoints(flagKey, runningKey, label)
 			pcall(function()
 				local races = workspace:FindFirstChild("Races")
 				if races then
+					-- deobfuscated.lua: race toggles drive checkpoints at AutoRaceSpeed
+					local seat = seatOf()
+					if seat and seat:IsA("VehicleSeat") then seat.MaxSpeed = AutoRaceSpeed end
 					for _, cp in ipairs(races:GetDescendants()) do
 						if not Flags[flagKey] or Unloaded then break end
 						if cp:IsA("BasePart") and (cp.Name:lower():find("checkpoint") or cp.Name:lower():find("lap")) then
@@ -611,7 +669,7 @@ RaceTab:AddToggle({
 	Icon     = "flag",
 	Default  = false,
 	Callback = function(state)
-		console:Write("Auto Race " .. (state and "enabled" or "disabled"))
+		report("Auto Race", state)
 		if state then
 			driveCheckpoints("AutoRace", "_raceRunning")
 		else
@@ -626,7 +684,7 @@ RaceTab:AddToggle({
 	Icon     = "wind",
 	Default  = false,
 	Callback = function(state)
-		console:Write("Auto Drift Race " .. (state and "enabled" or "disabled"))
+		report("Auto Drift Race", state)
 		if state then
 			driveCheckpoints("AutoDrift", "_driftRunning")
 		else
@@ -636,12 +694,12 @@ RaceTab:AddToggle({
 })
 
 RaceTab:AddToggle({
-	Title    = "AutoFarm [laps|checkpoints]",
+	Title    = "AutoFarm[laps|checkpoints]",
 	Subtitle = "Laps / checkpoints farm",
 	Icon     = "repeat",
 	Default  = false,
 	Callback = function(state)
-		console:Write("AutoFarm laps " .. (state and "enabled" or "disabled"))
+		report("AutoFarm[laps|checkpoints]", state)
 		if state then
 			driveCheckpoints("AutoLaps", "_lapsRunning")
 		else
@@ -659,8 +717,9 @@ MiscTab:AddButton({
 	Icon     = "map",
 	Text     = "Load",
 	Callback = function()
+		-- deobfuscated.lua: Misc "Force Load Map" = workspace:GetDescendants()
 		local _ = workspace:GetDescendants()
-		console:Write("Map touched")
+		report("Force Load Map", true)
 	end,
 })
 
@@ -687,7 +746,8 @@ MiscTab:AddDropdown({
 				moveTo(part.CFrame + Vector3.new(0, 5, 0))
 			end
 		end)
-		console:Write("Race teleport: " .. tostring(selected))
+		pcall(function() console:Write("Race teleport: " .. tostring(selected)) end)
+		pcall(function() status:Set("Status: teleported " .. tostring(selected)) end)
 	end,
 })
 
@@ -697,6 +757,7 @@ MiscTab:AddToggle({
 	Default  = false,
 	Callback = function(state)
 		Flags.AutoDelux = state
+		report("Auto Open Delux Custom Crate", state)
 		if not state or Flags._deluxRunning then return end
 		Flags._deluxRunning = true
 		task.spawn(function()
@@ -716,6 +777,7 @@ MiscTab:AddToggle({
 	Default  = false,
 	Callback = function(state)
 		Flags.AutoCrate = state
+		report("Auto Open Custom Crate", state)
 		if not state or Flags._crateRunning then return end
 		Flags._crateRunning = true
 		task.spawn(function()
@@ -735,6 +797,7 @@ MiscTab:AddToggle({
 	Default  = false,
 	Callback = function(state)
 		Flags.AutoEvent = state
+		report("Auto Open Event Crate", state)
 		if not state or Flags._eventRunning then return end
 		Flags._eventRunning = true
 		task.spawn(function()
@@ -754,6 +817,7 @@ MiscTab:AddToggle({
 	Default  = false,
 	Callback = function(state)
 		Flags.AutoBuy = state
+		report("Auto Buy Event Crate", state)
 		if not state or Flags._buyRunning then return end
 		Flags._buyRunning = true
 		task.spawn(function()
