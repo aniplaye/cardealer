@@ -254,6 +254,29 @@ local function sortedByDistance(list, fromPos)
 	return list
 end
 
+-- Cached folder scans: Collectibles/SpeedCameras rescanned every pass froze big maps.
+-- Cache for 10s, refreshed in background while the loop runs.
+local FolderCache = {}
+local function cachedDescs(folder, wantParts)
+	local key = tostring(folder:GetFullName())
+	local now = os.clock()
+	local hit = FolderCache[key]
+	if hit and (now - hit.at) < 10 then return hit.list end
+	local list = {}
+	pcall(function()
+		for _, d in ipairs(folder:GetDescendants()) do
+			local okP = false
+			pcall(function() okP = wantParts and d:IsA("BasePart") or true end)
+			if okP then
+				table.insert(list, d)
+				if #list >= 200 then break end
+			end
+		end
+	end)
+	FolderCache[key] = { at = now, list = list }
+	return list
+end
+
 local function numericNameSort(list)
 	table.sort(list, function(a, b)
 		local na, nb = a.Name, b.Name
@@ -296,7 +319,7 @@ Window = VantixUI:CreateWindow({
 })
 
 Window:CreateTag("Beta", Color3.fromRGB(240, 100, 100), nil, "flask-conical")
-Window:CreateTag("V1.5", Color3.fromRGB(60, 120, 210), nil, "git-branch")
+Window:CreateTag("V1.7", Color3.fromRGB(60, 120, 210), nil, "git-branch")
 
 Window:Notify({
 	Title    = "Vena's private Bypass",
@@ -543,7 +566,7 @@ MainTab:AddToggle({
 				-- deobfuscated.lua trace: SeatPart checks + workspace.Collectibles:GetDescendants()
 				local seat = seatOf()
 				local _vehicle = seat and seat.Parent and seat.Parent.Parent
-				for _, d in ipairs(folder:GetDescendants()) do
+				for _, d in ipairs(cachedDescs(folder, true)) do
 					if not Flags.AutoCollectibles or Unloaded then break end
 					if d:IsA("BasePart") then
 						found = true
@@ -630,24 +653,35 @@ MainTab:AddToggle({
 		if not state or Flags._sellRunning then return end
 		local sellPart
 		pcall(function()
+			local checked = 0
 			for _, d in ipairs(workspace:GetDescendants()) do
-				if d:IsA("BasePart") and d.Name:lower():find("sell") then
-					sellPart = d
-					break
+				checked += 1
+				if checked > 30000 then break end
+				local okS, isP = pcall(function() return d:IsA("BasePart") end)
+				if okS and isP then
+					local okN, n = pcall(function() return d.Name:lower() end)
+					if okN and n and n:find("sell") then
+						sellPart = d
+						break
+					end
 				end
 			end
 		end)
 		if not sellPart then
 			notify("No sell point found (looked for *sell*)")
+			pcall(function() status:Set("Status: Auto Sell - no *sell* part") end)
 			Flags.AutoSell = false
 			return
 		end
+		pcall(function()
+			console:Write("Auto Sell point: " .. sellPart:GetFullName())
+			status:Set("Status: Auto Sell - " .. sellPart.Name)
+		end)
 		Flags._sellRunning = true
 		task.spawn(function()
 			while Flags.AutoSell and not Unloaded do
-				moveTo(sellPart.CFrame + Vector3.new(0, 3, 0))
-				fireNearbyPrompts(sellPart.Position, 14)
-				task.wait(1)
+				collectTarget(sellPart, 16)
+				task.wait(1.2)
 			end
 			Flags._sellRunning = false
 		end)
@@ -676,11 +710,11 @@ MainTab:AddToggle({
 				local seat = seatOf()
 				local _vehicle = seat and seat.Parent and seat.Parent.Parent
 				if seat and seat:IsA("VehicleSeat") then pcall(function() seat.MaxSpeed = AutoDriveSpeed end) end
-				for _, cam in ipairs(folder:GetDescendants()) do
+				for _, cam in ipairs(cachedDescs(folder, true)) do
 					if not Flags.AutoTraps or Unloaded then break end
 					if cam:IsA("BasePart") then
-						moveTo(cam.CFrame)
-						task.wait(0.3)
+						collectTarget(cam, 16)
+						task.wait(0.5)
 					end
 				end
 				task.wait(0.5)
@@ -705,6 +739,7 @@ MainTab:AddToggle({
 		if Flags._deliveryRunning then return end
 		Flags._deliveryRunning = true
 		task.spawn(function()
+			local warnedDel = false
 			while Flags.AutoDelivery and not Unloaded do
 					local ok = pcall(function()
 					-- deobfuscated.lua trace: Head, WaitForChild(Humanoid), Humanoid.Sit
@@ -718,7 +753,11 @@ MainTab:AddToggle({
 							seat.ThrottleFloat = 1
 						end
 					else
-						notify("Auto Delivery: sit in a vehicle")
+						if not warnedDel then
+							warnedDel = true
+							notify("Auto Delivery: sit in a vehicle")
+						end
+						pcall(function() status:Set("Status: Auto Delivery - waiting for vehicle") end)
 						task.wait(3)
 					end
 				end)
@@ -785,7 +824,10 @@ MainTab:AddButton({
 			Flags[k] = false
 		end
 		local seat = seatOf()
-		if seat and seat:IsA("VehicleSeat") then pcall(function() seat.ThrottleFloat = 0 end) end
+		if seat and seat:IsA("VehicleSeat") then pcall(function()
+			seat.ThrottleFloat = 0
+			seat.SteerFloat = 0
+		end) end
 		report("All loops", false)
 		pcall(function() status:Set("Status: all stopped") end)
 	end,
@@ -870,6 +912,7 @@ DeliveryTab:AddToggle({
 		end)
 		Flags._delivery2Running = true
 		task.spawn(function()
+			local warnedDel2 = false
 			while Flags.AutoDelivery2 and not Unloaded do
 				pcall(function()
 					local char = LP.Character
@@ -880,6 +923,12 @@ DeliveryTab:AddToggle({
 							seat.MaxSpeed = AutoDriveSpeed
 							seat.ThrottleFloat = 1
 						end
+					else
+						if not warnedDel2 then
+							warnedDel2 = true
+							notify("Auto Delivery: sit in a vehicle")
+						end
+						pcall(function() status:Set("Status: Auto Delivery - waiting for vehicle") end)
 					end
 				end)
 				task.wait(1)
@@ -894,17 +943,59 @@ DeliveryTab:AddToggle({
 -- ===== 6. Race =====
 local RaceTab = Window:AddTab("Race", "flag")
 
-local AutoRaceSpeed = 100
-local SelectedRace = "All"
-local raceSpeedBox = RaceTab:AddTextBox({
-	Title       = "Enter Auto Race Speed",
-	Icon        = "gauge",
-	Placeholder = "Enter Auto Race Speed...",
-	Default     = "100",
-	Callback    = function(text)
-		AutoRaceSpeed = tonumber(text) or AutoRaceSpeed
-	end,
-})
+-- Race parts are cached per race: scanning GetDescendants() on every lap froze
+-- big Halloween races until the game had to be closed. Compute once per toggle.
+local RaceCache = {}
+local function clearRaceCache() RaceCache = {} end
+local function collectRaceParts(raceRoot)
+	local key = tostring(raceRoot:GetFullName())
+	if RaceCache[key] then return RaceCache[key] end
+	local strict, fallback = {}, {}
+	local descs = {}
+	pcall(function() descs = raceRoot:GetDescendants() end)
+	for _, d in ipairs(descs) do
+		local okIs = false
+		pcall(function() okIs = d:IsA("BasePart") end)
+		if okIs then
+			local okN, n = pcall(function() return d.Name:lower() end)
+			if okN and n then
+				if n:find("checkpoint") or n:find("check") or n == "cp"
+					or n:find("lap") or n:find("start") or n:find("finish")
+					or n:find("gate") or n:find("ring") then
+					table.insert(strict, d)
+				else
+					if #fallback < 40 then table.insert(fallback, d) end
+				end
+				if #strict >= 150 then break end
+			end
+		end
+		if #strict >= 150 then break end
+	end
+	local out
+	if #strict > 0 then
+		out = numericNameSort(strict)
+	else
+		out = numericNameSort(fallback)
+	end
+	if #out > 150 then
+		local trimmed = {}
+		for i = 1, 150 do trimmed[i] = out[i] end
+		out = trimmed
+	end
+	RaceCache[key] = out
+	return out
+end
+
+local function collectRacePoint(cp)
+	if not cp then return end
+	moveTo(cp.CFrame + Vector3.new(0, 3, 0))
+	-- fast path: cached prompts + touch only (no parent-model scan: that froze Halloween races)
+	pcall(function()
+		local okPos, pp = pcall(function() return cp.Position end)
+		if okPos and pp then fireNearbyPrompts(pp, 16) end
+	end)
+	tryTouch(cp)
+end
 
 local function findRaceFolders()
 	local folders = {}
@@ -939,6 +1030,27 @@ local function findHalloweenRoot()
 	return nil, nil
 end
 
+local function findRaceRootByName(name)
+	for _, folder in ipairs(findRaceFolders()) do
+		local f = folder:FindFirstChild(name)
+		if f then return f end
+	end
+	return nil
+end
+
+local AutoRaceSpeed = 100
+local SelectedRace = "All"
+local RaceMode = "Hybrid"
+local raceSpeedBox = RaceTab:AddTextBox({
+	Title       = "Enter Auto Race Speed",
+	Icon        = "gauge",
+	Placeholder = "Enter Auto Race Speed...",
+	Default     = "100",
+	Callback    = function(text)
+		AutoRaceSpeed = tonumber(text) or AutoRaceSpeed
+	end,
+})
+
 local function getRaceList()
 	local names = { "All" }
 	pcall(function()
@@ -954,14 +1066,6 @@ local function getRaceList()
 	return names
 end
 
-local function findRaceRootByName(name)
-	for _, folder in ipairs(findRaceFolders()) do
-		local f = folder:FindFirstChild(name)
-		if f then return f end
-	end
-	return nil
-end
-
 local targetRaceDropdown = RaceTab:AddDropdown({
 	Title    = "Target Race",
 	Icon     = "map-pin",
@@ -969,7 +1073,19 @@ local targetRaceDropdown = RaceTab:AddDropdown({
 	Default  = "All",
 	Callback = function(selected)
 		SelectedRace = selected
+		clearRaceCache()
 		pcall(function() console:Write("Target race: " .. tostring(selected)) end)
+	end,
+})
+
+local raceModeDropdown = RaceTab:AddDropdown({
+	Title    = "Race Mode",
+	Icon     = "settings-2",
+	Options  = { "Hybrid", "Teleport", "Drive" },
+	Default  = "Hybrid",
+	Callback = function(selected)
+		RaceMode = selected
+		pcall(function() console:Write("Race mode: " .. tostring(selected)) end)
 	end,
 })
 
@@ -1006,7 +1122,7 @@ RaceTab:AddButton({
 
 RaceTab:AddButton({
 	Title    = "Refresh Race List",
-	Subtitle = "Rescans workspace.Races",
+	Subtitle = "Rescans race folders",
 	Icon     = "refresh-cw",
 	Text     = "Refresh",
 	Callback = function()
@@ -1017,61 +1133,93 @@ RaceTab:AddButton({
 	end,
 })
 
--- Race parts are cached per race: scanning GetDescendants() on every lap froze
--- big Halloween races until the game had to be closed. Compute once per toggle.
-local RaceCache = {}
-local function clearRaceCache() RaceCache = {} end
-local function collectRaceParts(raceRoot)
-	local key = tostring(raceRoot:GetFullName())
-	if RaceCache[key] then return RaceCache[key] end
-	local strict, fallback = {}, {}
-	local descs = {}
-	pcall(function() descs = raceRoot:GetDescendants() end)
-	for _, d in ipairs(descs) do
-		local okIs = false
-		pcall(function() okIs = d:IsA("BasePart") end)
-		if okIs then
-			local okN, n = pcall(function() return d.Name:lower() end)
-			if okN and n then
-				if n:find("checkpoint") or n:find("check") or n == "cp"
-					or n:find("lap") or n:find("start") or n:find("finish")
-					or n:find("gate") or n:find("ring") then
-					table.insert(strict, d)
-				else
-					if #fallback < 40 then table.insert(fallback, d) end
+RaceTab:AddButton({
+	Title    = "Diagnose Races",
+	Subtitle = "Dumps race structure to console + file",
+	Icon     = "stethoscope",
+	Text     = "Scan",
+	Callback = function()
+		task.spawn(function()
+			local lines = { "Vena race diag " .. os.date("%X") }
+			for _, folder in ipairs(findRaceFolders()) do
+				local okF, fname = pcall(function() return folder:GetFullName() end)
+				table.insert(lines, "FOLDER: " .. (okF and fname or "?"))
+				local okC, kids = pcall(function() return folder:GetChildren() end)
+				if okC then
+					for _, r in ipairs(kids) do
+						local okD, nd = pcall(function() return #r:GetDescendants() end)
+						local cps = collectRaceParts(r)
+						table.insert(lines, string.format("  RACE %s descs=%s points=%d", r.Name, okD and tostring(nd) or "?", #cps))
+						for i = 1, math.min(8, #cps) do
+							table.insert(lines, "    - " .. cps[i]:GetFullName())
+						end
+					end
 				end
-				if #strict >= 150 then break end
 			end
+			local blob = table.concat(lines, "\n")
+			pcall(function() console:Write(blob) end)
+			pcall(function() writefile("venas_race_diag.txt", blob) end)
+			notify("Race diag saved (console + venas_race_diag.txt)")
+		end)
+	end,
+})
+
+-- Physics drive: face the target in place, then throttle through it.
+-- No position teleports here, so teleport-guarded games still progress.
+local function driveSteerTo(targetPos, speed, timeoutS, flagKey)
+	timeoutS = timeoutS or 14
+	local t0 = os.clock()
+	local lastDist, lastT, hops = nil, os.clock(), 0
+	while Flags[flagKey] and not Unloaded and (os.clock() - t0) < timeoutS do
+		local seat = seatOf()
+		if not seat or not seat:IsA("VehicleSeat") then return false end
+		local vehicle = findVehicleOf(seat)
+		if not vehicle then return false end
+		local okP, pivot = pcall(function() return vehicle:GetPivot() end)
+		if not okP or not pivot then task.wait(0.3) continue end
+		local pos = pivot.Position
+		local to = targetPos - pos
+		to = Vector3.new(to.X, 0, to.Z)
+		local dist = to.Magnitude
+		if dist < 16 then
+			pcall(function()
+				seat.MaxSpeed = speed
+				seat.ThrottleFloat = 1
+				seat.SteerFloat = 0
+			end)
+			task.wait(0.4)
+			return true
 		end
-		if #strict >= 150 then break end
+		if lastDist and (lastDist - dist) < 1 and (os.clock() - lastT) > 4 then
+			-- stuck: hop up to unstick, then keep driving
+			hops += 1
+			lastT = os.clock()
+			pcall(function() vehicle:PivotTo(pivot + Vector3.new(0, 8, 0)) end)
+			if hops >= 2 then return false end
+		else
+			if not lastDist or (lastDist - dist) >= 1 then lastDist, lastT = dist, os.clock() end
+		end
+		if to.Magnitude > 0.5 then
+			pcall(function() vehicle:PivotTo(CFrame.lookAt(pos, pos + to)) end)
+		end
+		pcall(function()
+			seat.MaxSpeed = speed
+			seat.ThrottleFloat = 1
+			seat.SteerFloat = 0
+		end)
+		task.wait(0.3)
 	end
-	local out
-	if #strict > 0 then
-		out = numericNameSort(strict)
-	else
-		-- No named checkpoints: do NOT grind thousands of decorative parts.
-		-- Cap at 40 and let the status line say so.
-		out = numericNameSort(fallback)
-	end
-	if #out > 150 then
-		local trimmed = {}
-		for i = 1, 150 do trimmed[i] = out[i] end
-		out = trimmed
-	end
-	RaceCache[key] = out
-	return out
+	return false
 end
 
-local function collectRacePoint(cp)
-	if not cp then return end
-	moveTo(cp.CFrame + Vector3.new(0, 3, 0))
-	-- fast path: cached prompts + touch only. collectTarget()'s full
-	-- parent-model scan is what froze Halloween races.
-	pcall(function()
-		local okPos, pp = pcall(function() return cp.Position end)
-		if okPos and pp then fireNearbyPrompts(pp, 16) end
-	end)
-	tryTouch(cp)
+local function raceApproach(cpPos)
+	local _, _, root = parts()
+	if not root then return cpPos end
+	local cur = root.Position
+	local dir = cpPos - cur
+	local flat = Vector3.new(dir.X, 0, dir.Z)
+	if flat.Magnitude < 45 then return cpPos + Vector3.new(0, 4, 0) end
+	return cpPos - flat.Unit * 35 + Vector3.new(0, 5, 0)
 end
 
 local function driveCheckpoints(flagKey, runningKey, mode)
@@ -1081,17 +1229,11 @@ local function driveCheckpoints(flagKey, runningKey, mode)
 	task.spawn(function()
 		clearRaceCache()
 		local warnedSeat = false
-		local stallN = 0
+		local stallN, lapN = 0, 0
 		while Flags[flagKey] and not Unloaded do
 			local did = false
 			pcall(function()
-				local races = workspace:FindFirstChild("Races")
-				if not races then
-					pcall(function() status:Set("Status: Race - workspace.Races not found") end)
-					return
-				end
 				local folders = findRaceFolders()
-				local races = workspace:FindFirstChild("Races")
 				if #folders == 0 then
 					pcall(function() status:Set("Status: Race - no race folders found") end)
 					return
@@ -1115,15 +1257,14 @@ local function driveCheckpoints(flagKey, runningKey, mode)
 					if not Flags[flagKey] or Unloaded then break end
 					task.wait(0.1)
 					local cps = collectRaceParts(root)
-					if #cps >= 150 then
-						pcall(function() console:Write("Race " .. root.Name .. ": capped at 150 points") end)
-					elseif #cps > 0 and #cps <= 40 then
-						-- likely the no-named-checkpoint fallback
-						pcall(function() console:Write("Race " .. root.Name .. ": no named checkpoints, using " .. #cps .. " parts (pick Target Race + Refresh if wrong)") end)
-					end
 					if #cps == 0 then
 						pcall(function() status:Set("Status: Race - no parts in " .. root.Name) end)
 					else
+						-- fire start-line prompts once per lap so the game registers us
+						pcall(function()
+							local first = firstPart(cps[1])
+							if first then fireNearbyPrompts(first.Position, 30) end
+						end)
 						for i, cp in ipairs(cps) do
 							if not Flags[flagKey] or Unloaded then break end
 							did = true
@@ -1137,12 +1278,32 @@ local function driveCheckpoints(flagKey, runningKey, mode)
 									notify("Race: sit in a vehicle for vehicle races")
 								end
 							end
-							pcall(function()
-								status:Set("Status: Race " .. root.Name .. " " .. i .. "/" .. #cps)
-							end)
-							collectRacePoint(cp)
-							task.wait(mode == "drift" and 0.5 or 0.7)
+							local okCp, cpPos = pcall(function() return cp.Position end)
+							if okCp and cpPos then
+								pcall(function()
+									status:Set("Status: Race " .. root.Name .. " " .. i .. "/" .. #cps .. " lap " .. (lapN + 1) .. " [" .. RaceMode .. "]")
+								end)
+								if RaceMode == "Teleport" then
+									collectRacePoint(cp)
+									task.wait(mode == "drift" and 0.5 or 0.7)
+								elseif RaceMode == "Drive" then
+									driveSteerTo(cpPos + Vector3.new(0, 3, 0), speed, 14, flagKey)
+								else
+									-- Hybrid: teleport to 35 out, face it, drive through physically
+									local ap = raceApproach(cpPos)
+									local facing = CFrame.lookAt(ap, Vector3.new(cpPos.X, ap.Y, cpPos.Z))
+									local seatNow = seatOf()
+									if seatNow then
+										local v = findVehicleOf(seatNow)
+										if v then pcall(function() v:PivotTo(facing) end) end
+									else
+										moveTo(facing)
+									end
+									driveSteerTo(cpPos + Vector3.new(0, 3, 0), speed, 10, flagKey)
+								end
+							end
 						end
+						lapN += 1
 					end
 				end
 			end)
@@ -1153,14 +1314,19 @@ local function driveCheckpoints(flagKey, runningKey, mode)
 			if not did then task.wait(1.5) end
 		end
 		local seat = seatOf()
-		if seat and seat:IsA("VehicleSeat") then pcall(function() seat.ThrottleFloat = 0 end) end
+		if seat and seat:IsA("VehicleSeat") then
+			pcall(function()
+				seat.ThrottleFloat = 0
+				seat.SteerFloat = 0
+			end)
+		end
 		Flags[runningKey] = false
 	end)
 end
 
 RaceTab:AddToggle({
 	Title    = "Auto Race",
-	Subtitle = "Uses Target Race below; sit in vehicle",
+	Subtitle = "Uses Target Race + Race Mode; sit in vehicle",
 	Icon     = "flag",
 	Default  = false,
 	Callback = function(state)
@@ -1190,7 +1356,7 @@ RaceTab:AddToggle({
 
 RaceTab:AddToggle({
 	Title    = "AutoFarm[laps|checkpoints]",
-	Subtitle = "Loops Target Race checkpoints",
+	Subtitle = "Loops Target Race, counts laps",
 	Icon     = "repeat",
 	Default  = false,
 	Callback = function(state)
@@ -1410,6 +1576,8 @@ local function buildConfig(name)
 	cfg:RegisterElement("MinReward", minBox)
 	cfg:RegisterElement("MaxReward", maxBox)
 	cfg:RegisterElement("RaceSpeed", raceSpeedBox)
+	cfg:RegisterElement("TargetRace", targetRaceDropdown)
+	cfg:RegisterElement("RaceMode", raceModeDropdown)
 	cfg:RegisterElement("ConfigName", configName)
 	cfg:RegisterElement("UIKeybind", uiKeybind)
 	return cfg
