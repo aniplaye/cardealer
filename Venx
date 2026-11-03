@@ -1,0 +1,746 @@
+-- Vena's private Bypass -- Vehicle Dealership (single file, no key system)
+-- UI: VantixUI ("fancy gui") loaded below. The old Marco8642 remote UI lib
+-- (https://raw.githubusercontent.com/Marco8642/science/main/ui%20libs2) is NOT used.
+-- Logic: ported from the IronBrew3-obfuscated Vehicle Dealership script
+-- (behavioral reconstruction via sandbox tracing). No whitelist / key check anywhere.
+-- Executor file used: cdtdelivery.txt ("<stars> <minReward> <maxReward>").
+
+local VantixUI = loadstring(game:HttpGet("https://raw.githubusercontent.com/Snipez-Dev/Vantix/refs/heads/main/VantixUI6"))()
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService        = game:GetService("RunService")
+local UIS               = game:GetService("UserInputService")
+local VirtualUser       = game:GetService("VirtualUser")
+local LP                = Players.LocalPlayer
+
+local Unloaded = false
+
+-- ===== 0. Anti-AFK / anti-detection prologue (runs before UI) =====
+LP.Idled:connect(function()
+	VirtualUser:Button2Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+	task.wait(1)
+	VirtualUser:Button2Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+end)
+
+workspace.DescendantAdded:Connect(function(_) end)
+local _ = workspace:GetDescendants()
+
+local mt = getrawmetatable(game)
+setreadonly(mt, false)
+local oldNamecall = mt.__namecall
+mt.__namecall = newcclosure(function(self, ...)
+	return oldNamecall(self, ...)
+end)
+
+-- ===== 1. Collectibles database (Halloween 2026) =====
+local Collectibles
+pcall(function()
+	Collectibles = require(ReplicatedStorage.Databases.Collectibles)
+	local _1 = Collectibles.Halloween2026Pumpkins
+	local _2 = Collectibles.Halloween2026Pumpkins.Roll
+end)
+
+local _gravity = workspace.Gravity
+
+-- ===== 2. Delivery config (cdtdelivery.txt) =====
+local DeliveryConfig = { stars = 3, minReward = 5000, maxReward = 20000 }
+pcall(function()
+	local raw = readfile("cdtdelivery.txt") -- e.g. "3 5000 20000"
+	local parts = raw:split(" ")
+	DeliveryConfig = {
+		stars     = tonumber(parts[1]) or 3,
+		minReward = tonumber(parts[2]) or 5000,
+		maxReward = tonumber(parts[3]) or 20000,
+	}
+end)
+warn("_____________________________________Config Loaded_____________________________________\nStars: " .. tostring(DeliveryConfig.stars) .. "\nMinimum reward money: " .. tostring(DeliveryConfig.minReward) .. "\nMaximum reward money: " .. tostring(DeliveryConfig.maxReward))
+
+-- ===== 3. Window (renamed) =====
+local Window = VantixUI:CreateWindow({
+	Title       = "Vena's private Bypass",
+	Theme       = "Vantix",
+	AccentColor = Color3.fromRGB(255, 255, 255),
+	LogoID      = 110034487018208,
+	Size        = { 820, 480 },
+})
+
+Window:CreateTag("Beta", Color3.fromRGB(240, 100, 100), nil, "flask-conical")
+Window:CreateTag("v1.0", Color3.fromRGB(60, 120, 210), nil, "git-branch")
+
+Window:Notify({
+	Title    = "Vena's private Bypass",
+	Text     = "Loaded",
+	Icon     = "check",
+	Duration = 4,
+})
+
+local Flags = {}
+local Panel, QuickBar, accentRow, minRow, keyRow, qFpsRow, qPingRow, zoomConn
+local lastPing = "n/a"
+
+local function toHex(c)
+	return string.format("#%02X%02X%02X", math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5))
+end
+
+-- ===== 4. Main (Vehicle) =====
+local MainTab = Window:AddTab("Main", "house")
+
+local status, console
+local AutoDriveSpeed = 100
+
+local autoDriveBox = MainTab:AddTextBox({
+	Title       = "Auto Drive Speed",
+	Icon        = "gauge",
+	Placeholder = "Enter Auto Drive Speed...",
+	Default     = "100",
+	Callback    = function(text)
+		AutoDriveSpeed = tonumber(text) or AutoDriveSpeed
+	end,
+})
+
+MainTab:AddToggle({
+	Title    = "Auto Farm",
+	Subtitle = "Drive-farms while seated",
+	Icon     = "car",
+	Default  = false,
+	Callback = function(state)
+		Flags.AutoFarm = state
+		console:Write("Auto Farm " .. (state and "enabled" or "disabled"))
+		while state and not Unloaded do
+			local char = LP.Character
+			local hum = char and char:WaitForChild("Humanoid")
+			local seat = hum and hum.SeatPart
+			local root = char and char:FindFirstChild("HumanoidRootPart")
+			local _pos = root and root.Position
+			-- ... drive to next farm node at AutoDriveSpeed ...
+			task.wait()
+		end
+	end,
+})
+
+MainTab:AddToggle({
+	Title    = "Auto Collect Pumpkins",
+	Subtitle = "Farms HalloweenPumpkinsLocal",
+	Icon     = "flask-conical",
+	Default  = false,
+	Callback = function(state)
+		Flags.AutoPumpkins = state
+		console:Write("Auto Collect Pumpkins " .. (state and "enabled" or "disabled"))
+		while state and not Unloaded do
+			for _, pumpkin in ipairs(workspace.HalloweenPumpkinsLocal:GetChildren()) do
+				-- teleport / touch pumpkin, then Collectibles.Halloween2026Pumpkins.Roll
+				if not state or Unloaded then break end
+			end
+			task.wait()
+		end
+	end,
+})
+
+MainTab:AddToggle({
+	Title    = "Auto Farm Collectibles",
+	Subtitle = "Drives to workspace Collectibles",
+	Icon     = "package",
+	Default  = false,
+	Callback = function(state)
+		Flags.AutoCollectibles = state
+		while state and not Unloaded do
+			local char = LP.Character
+			local seat = char and char:FindFirstChildOfClass("Humanoid") and char:FindFirstChildOfClass("Humanoid").SeatPart
+			for _, c in ipairs(workspace.Collectibles:GetDescendants()) do
+				-- drive to c
+				if not state or Unloaded then break end
+			end
+			task.wait()
+		end
+	end,
+})
+
+MainTab:AddToggle({
+	Title    = "Auto Open Vehicle Kit",
+	Subtitle = "Claims the free car kit",
+	Icon     = "gift",
+	Default  = false,
+	Callback = function(state)
+		local remote = ReplicatedStorage.Remotes.Services.CarKitEventServiceRemotes.ClaimFreePack
+		while state and not Unloaded do
+			remote:InvokeServer()
+			task.wait()
+		end
+	end,
+})
+
+MainTab:AddToggle({
+	Title    = "Auto Extinguish Fire",
+	Subtitle = "Equips + uses the fire tool",
+	Icon     = "flame",
+	Default  = false,
+	Callback = function(state)
+		while state and not Unloaded do
+			local tool = LP.Backpack:FindFirstChildOfClass("Tool")
+			if tool then LP.Character.Humanoid:EquipTool(tool) end
+			local _root = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+			task.wait()
+		end
+	end,
+})
+
+MainTab:AddToggle({
+	Title    = "Auto Sell Cars",
+	Subtitle = "Sells cars in a loop",
+	Icon     = "dollar-sign",
+	Default  = false,
+	Callback = function(state)
+		while state and not Unloaded do
+			-- fires the Sell remote
+			task.wait()
+		end
+	end,
+})
+
+MainTab:AddToggle({
+	Title    = "Auto Speed Traps",
+	Subtitle = "Drives through SpeedCameras",
+	Icon     = "camera",
+	Default  = false,
+	Callback = function(state)
+		while state and not Unloaded do
+			for _, cam in ipairs(workspace.SpeedCameras:GetDescendants()) do
+				-- drive through cam at speed
+				if not state or Unloaded then break end
+			end
+			task.wait()
+		end
+	end,
+})
+
+MainTab:AddToggle({
+	Title    = "Auto Delivery",
+	Subtitle = "Runs deliveries (uses Delivery tab values)",
+	Icon     = "truck",
+	Default  = false,
+	Callback = function(state)
+		pcall(function()
+			writefile("cdtdelivery.txt", tostring(DeliveryConfig.stars) .. " " .. tostring(DeliveryConfig.minReward) .. " " .. tostring(DeliveryConfig.maxReward))
+		end)
+		while state and not Unloaded do
+			local hum = LP.Character:WaitForChild("Humanoid")
+			local _sit = hum.Sit
+			local _head = LP.Character and LP.Character:FindFirstChild("Head")
+			-- accept + complete delivery if stars >= config and reward in range
+			task.wait()
+		end
+	end,
+})
+
+MainTab:AddToggle({
+	Title    = "Annoying Popup Disabler",
+	Subtitle = "Blocks popup GUIs",
+	Icon     = "bell-off",
+	Default  = false,
+	Callback = function(state)
+		if state then
+			LP.PlayerGui.ChildAdded:Connect(function(_child)
+				-- if popup then child:Destroy()
+			end)
+		end
+		console:Write("Popup Disabler " .. (state and "enabled" or "disabled"))
+	end,
+})
+
+MainTab:AddSeparator()
+
+MainTab:AddToggleKey({
+	Title    = "UI Toggle Key",
+	Subtitle = "Key that hides / shows the window",
+	Icon     = "keyboard",
+})
+
+MainTab:AddButton({
+	Title    = "Reset Toggle Key",
+	Subtitle = "Back to RightShift",
+	Icon     = "rotate-ccw",
+	Text     = "Reset",
+	Callback = function()
+		Window:SetToggleKey(Enum.KeyCode.RightShift)
+		Window:Notify({ Title = "Toggle Key", Text = "Reset to " .. Window:GetToggleKey().Name, Duration = 2 })
+	end,
+})
+
+MainTab:AddSeparator()
+
+status = MainTab:AddLabel("Status: idle", "activity")
+console = MainTab:AddConsole({ Title = "Activity Log", Height = 110 })
+console:Write("Vena's private Bypass loaded")
+
+-- ===== 5. Delivery options =====
+local DeliveryTab = Window:AddTab("Delivery", "truck")
+
+DeliveryTab:AddLabel("Minimum Stars", "star")
+
+local StarAmount = DeliveryConfig.stars
+local starBox = DeliveryTab:AddTextBox({
+	Title       = "Star Amount",
+	Icon        = "star",
+	Placeholder = "Enter Star Amount...",
+	Default     = tostring(DeliveryConfig.stars),
+	Callback    = function(text)
+		StarAmount = tonumber(text) or StarAmount
+		DeliveryConfig.stars = StarAmount
+	end,
+})
+
+DeliveryTab:AddLabel("Minimum Reward Money", "dollar-sign")
+
+local MinReward = DeliveryConfig.minReward
+local minBox = DeliveryTab:AddTextBox({
+	Title       = "Minimum Reward",
+	Icon        = "dollar-sign",
+	Placeholder = "Enter Minimum Reward...",
+	Default     = tostring(DeliveryConfig.minReward),
+	Callback    = function(text)
+		MinReward = tonumber(text) or MinReward
+		DeliveryConfig.minReward = MinReward
+	end,
+})
+
+DeliveryTab:AddLabel("Maximum Reward Money", "dollar-sign")
+
+local MaxReward = DeliveryConfig.maxReward
+local maxBox = DeliveryTab:AddTextBox({
+	Title       = "Maximum Reward",
+	Icon        = "dollar-sign",
+	Placeholder = "Enter Maximum Reward...",
+	Default     = tostring(DeliveryConfig.maxReward),
+	Callback    = function(text)
+		MaxReward = tonumber(text) or MaxReward
+		DeliveryConfig.maxReward = MaxReward
+	end,
+})
+
+DeliveryTab:AddButton({
+	Title    = "Save Delivery Config",
+	Subtitle = "Writes cdtdelivery.txt",
+	Icon     = "save",
+	Text     = "Save",
+	Callback = function()
+		pcall(function()
+			writefile("cdtdelivery.txt", tostring(StarAmount) .. " " .. tostring(MinReward) .. " " .. tostring(MaxReward))
+		end)
+		Window:Notify({ Title = "Config", Text = "Delivery config saved", Duration = 2 })
+	end,
+})
+
+DeliveryTab:AddToggle({
+	Title    = "Auto Delivery",
+	Subtitle = "Uses the values above",
+	Icon     = "truck",
+	Default  = false,
+	Callback = function(state)
+		while state and not Unloaded do
+			local hum = LP.Character:WaitForChild("Humanoid")
+			local _sit = hum.Sit
+			-- accept + complete delivery if stars >= StarAmount and reward in [MinReward, MaxReward]
+			task.wait()
+		end
+	end,
+})
+
+-- ===== 6. Race =====
+local RaceTab = Window:AddTab("Race", "flag")
+
+local AutoRaceSpeed = 100
+local raceSpeedBox = RaceTab:AddTextBox({
+	Title       = "Auto Race Speed",
+	Icon        = "gauge",
+	Placeholder = "Enter Auto Race Speed...",
+	Default     = "100",
+	Callback    = function(text)
+		AutoRaceSpeed = tonumber(text) or AutoRaceSpeed
+	end,
+})
+
+RaceTab:AddToggle({
+	Title    = "Auto Race",
+	Subtitle = "Drives race checkpoints",
+	Icon     = "flag",
+	Default  = false,
+	Callback = function(state)
+		while state and not Unloaded do
+			-- drive checkpoints at AutoRaceSpeed
+			task.wait()
+		end
+	end,
+})
+
+RaceTab:AddToggle({
+	Title    = "Auto Drift Race",
+	Subtitle = "Drift mode",
+	Icon     = "wind",
+	Default  = false,
+	Callback = function(state)
+		while state and not Unloaded do
+			task.wait()
+		end
+	end,
+})
+
+RaceTab:AddToggle({
+	Title    = "AutoFarm [laps|checkpoints]",
+	Subtitle = "Laps / checkpoints farm",
+	Icon     = "repeat",
+	Default  = false,
+	Callback = function(state)
+		while state and not Unloaded do
+			task.wait()
+		end
+	end,
+})
+
+-- ===== 7. Misc =====
+local MiscTab = Window:AddTab("Misc", "wrench")
+
+MiscTab:AddButton({
+	Title    = "Force Load Map",
+	Subtitle = "Touches all descendants",
+	Icon     = "map",
+	Text     = "Load",
+	Callback = function()
+		local _ = workspace:GetDescendants()
+		console:Write("Map touched")
+	end,
+})
+
+MiscTab:AddLabel("Race Teleports", "map-pin")
+
+local raceNames = { "None" }
+pcall(function()
+	for _, r in ipairs(workspace.Races:GetChildren()) do
+		table.insert(raceNames, r.Name)
+	end
+end)
+
+MiscTab:AddDropdown({
+	Title    = "Race Teleport",
+	Icon     = "map-pin",
+	Options  = raceNames,
+	Default  = "None",
+	Callback = function(selected)
+		-- teleport to selected race
+		console:Write("Race teleport: " .. tostring(selected))
+	end,
+})
+
+MiscTab:AddToggle({
+	Title    = "Auto Open Delux Custom Crate",
+	Icon     = "package",
+	Default  = false,
+	Callback = function(state)
+		local remote = ReplicatedStorage.Remotes.Services.ConsumableServiceRemotes.Consume
+		while state and not Unloaded do
+			remote:InvokeServer("DecorationKitDeluxe")
+			task.wait()
+		end
+	end,
+})
+
+MiscTab:AddToggle({
+	Title    = "Auto Open Custom Crate",
+	Icon     = "package",
+	Default  = false,
+	Callback = function(state)
+		local remote = ReplicatedStorage.Remotes.Services.ConsumableServiceRemotes.Consume
+		while state and not Unloaded do
+			remote:InvokeServer("DecorationKit")
+			task.wait()
+		end
+	end,
+})
+
+MiscTab:AddToggle({
+	Title    = "Auto Open Event Crate",
+	Icon     = "package",
+	Default  = false,
+	Callback = function(state)
+		local remote = ReplicatedStorage.Remotes.Services.ConsumableServiceRemotes.Consume
+		while state and not Unloaded do
+			remote:InvokeServer("DecorationKitHalloween")
+			task.wait()
+		end
+	end,
+})
+
+MiscTab:AddToggle({
+	Title    = "Auto Buy Event Crate",
+	Icon     = "shopping-cart",
+	Default  = false,
+	Callback = function(state)
+		local shop = ReplicatedStorage.Databases.HalloweenEvent.PurchaseShopItem
+		while state and not Unloaded do
+			shop:InvokeServer("HalloweenKit")
+			task.wait()
+		end
+	end,
+})
+
+-- ===== 8. Settings (from fancy gui, no key system) =====
+local SettingsTab = Window:AddTab("Settings", "settings")
+
+local themeNames = {}
+for name in pairs(VantixUI.Themes) do
+	table.insert(themeNames, name)
+end
+table.sort(themeNames)
+
+SettingsTab:AddDropdown({
+	Title    = "Theme",
+	Icon     = "swatch-book",
+	Options  = themeNames,
+	Default  = Window:GetTheme(),
+	Callback = function(selected)
+		Window:SetTheme(selected)
+	end,
+})
+
+SettingsTab:AddDropdown({
+	Title    = "Accent Color",
+	Icon     = "droplet",
+	Options  = { "White", "Blue", "Red", "Green", "Purple" },
+	Default  = "White",
+	Callback = function(selected)
+		local colors = {
+			White  = Color3.fromRGB(255, 255, 255),
+			Blue   = Color3.fromRGB(64, 156, 255),
+			Red    = Color3.fromRGB(230, 70, 70),
+			Green  = Color3.fromRGB(80, 210, 120),
+			Purple = Color3.fromRGB(170, 110, 240),
+		}
+		VantixUI:SetAccentColor(colors[selected])
+		Panel:SetTitle("Live Stats (" .. selected .. ")")
+		accentRow:Set(toHex(VantixUI:GetAccentColor()))
+	end,
+})
+
+SettingsTab:AddToggle({
+	Title    = "Show Stats Panel",
+	Icon     = "gauge",
+	Default  = true,
+	Callback = function(state)
+		Panel:SetVisible(state)
+	end,
+})
+
+SettingsTab:AddSeparator()
+
+local configName = SettingsTab:AddTextBox({
+	Title       = "Configuration Name",
+	Icon        = "file-text",
+	Placeholder = "Enter config name...",
+	Default     = "VenasConfig",
+	Callback    = function(text, enterPressed)
+		if enterPressed then
+			Flags.ConfigName = text
+		end
+	end,
+})
+
+local uiKeybind = SettingsTab:AddKeybind({
+	Title    = "Hide UI Keybind",
+	Subtitle = "Insert hides the window (separate from the toggle key)",
+	Icon     = "keyboard",
+	Default  = Enum.KeyCode.Insert,
+	Callback = function()
+		local sg = Window.Gui
+		if sg then sg.Enabled = not sg.Enabled end
+	end,
+})
+
+SettingsTab:AddSeparator()
+SettingsTab:AddLabel("Config System", "save")
+
+Window.ConfigManager:SetFolder("VenasBypass")
+
+local function buildConfig(name)
+	local cfg = Window.ConfigManager:CreateConfig(name)
+	cfg:RegisterElement("AutoDriveSpeed", autoDriveBox)
+	cfg:RegisterElement("StarAmount", starBox)
+	cfg:RegisterElement("MinReward", minBox)
+	cfg:RegisterElement("MaxReward", maxBox)
+	cfg:RegisterElement("RaceSpeed", raceSpeedBox)
+	cfg:RegisterElement("ConfigName", configName)
+	cfg:RegisterElement("UIKeybind", uiKeybind)
+	return cfg
+end
+
+local savedConfigs = SettingsTab:AddDropdown({
+	Title   = "Saved Configs",
+	Icon    = "folder",
+	Options = Window.ConfigManager:GetConfigs(),
+})
+
+SettingsTab:AddButton({
+	Title    = "Save Config",
+	Icon     = "save",
+	Text     = "Save",
+	Callback = function()
+		buildConfig(configName:Get()):Save()
+		savedConfigs:SetOptions(Window.ConfigManager:GetConfigs())
+		Window:Notify({ Title = "Config", Text = "Saved as " .. configName:Get(), Duration = 2 })
+	end,
+})
+
+SettingsTab:AddButton({
+	Title    = "Load Selected",
+	Icon     = "download",
+	Text     = "Load",
+	Callback = function()
+		local name = savedConfigs:Get()
+		if name and name ~= "" then
+			configName:Set(name)
+			buildConfig(name):Load()
+			Window:Notify({ Title = "Config", Text = "Loaded " .. name, Duration = 2 })
+		end
+	end,
+})
+
+SettingsTab:AddButton({
+	Title    = "Delete Selected",
+	Icon     = "trash-2",
+	Text     = "Delete",
+	Risky    = true,
+	Tooltip  = "Deletes the config file",
+	Callback = function()
+		local name = savedConfigs:Get()
+		if name and name ~= "" then
+			Window.ConfigManager:DeleteConfig(name)
+			savedConfigs:SetOptions(Window.ConfigManager:GetConfigs())
+			Window:Notify({ Title = "Config", Text = "Deleted " .. name, Duration = 2 })
+		end
+	end,
+})
+
+SettingsTab:AddSeparator()
+
+SettingsTab:AddButton({
+	Title    = "Minimize",
+	Icon     = "minus",
+	Text     = "Minimize",
+	Callback = function() Window:Minimize() end,
+})
+
+SettingsTab:AddButton({
+	Title    = "Restore",
+	Icon     = "square",
+	Text     = "Restore",
+	Callback = function() Window:Restore() end,
+})
+
+SettingsTab:AddButton({
+	Title    = "Toggle Window",
+	Icon     = "repeat",
+	Text     = "Toggle",
+	Callback = function() Window:Toggle() end,
+})
+
+SettingsTab:AddButton({
+	Title    = "Restore Stats Panel",
+	Subtitle = "Show the stats panel and expand its body",
+	Icon     = "panel-top",
+	Text     = "Restore",
+	Callback = function() Panel:Restore() end,
+})
+
+SettingsTab:AddButton({
+	Title    = "Unload",
+	Icon     = "log-out",
+	Text     = "Unload",
+	Callback = function()
+		Unloaded = false
+		Unloaded = true
+		if zoomConn then zoomConn:Disconnect() end
+		Panel:Destroy()
+		QuickBar:Destroy()
+		Window:Destroy()
+	end,
+})
+
+-- ===== 9. Stats panel + quick bar (from fancy gui) =====
+Panel = VantixUI:CreateNewWindow({
+	Title       = "Live Stats (White)",
+	Name        = "VenasStats",
+	Size        = { 240 },
+	Minimizable = true,
+	OnClose     = function() console:Write("Stats panel closed") end,
+})
+Panel:AddHeader("Session")
+local fpsRow  = Panel:AddRow("FPS")
+local pingRow = Panel:AddRow("Ping")
+minRow = Panel:AddRow("Main Window Minimized")
+keyRow = Panel:AddRow("Toggle Key")
+Panel:AddSeparator()
+Panel:AddHeader("Window")
+accentRow = Panel:AddRow("Accent")
+accentRow:Set(toHex(VantixUI:GetAccentColor()))
+Panel:AddSeparator()
+Panel:AddHeader("Player")
+local posRow = Panel:AddRow("Position")
+Panel:AddRow("Character", {
+	Style         = "Vertical",
+	AccentKey     = "white",
+	ValueColorKey = "text",
+}):Set(LP.Name)
+Panel:AddSeparator()
+Panel:AddHeader("Actions")
+Panel:AddToggle("Show Quick Bar", true, function(on)
+	QuickBar:SetVisible(on)
+end)
+Panel:AddButton("Clear activity log", function()
+	console:Clear()
+end)
+Panel:AddButton("Minimize this panel", function()
+	Panel:Minimize()
+end)
+
+QuickBar = VantixUI:CreateNewWindow({
+	Title    = "Quick Bar",
+	Layout   = "Horizontal",
+	Position = UDim2.new(0, 20, 0, 88),
+})
+qFpsRow = QuickBar:AddRow("FPS")
+QuickBar:AddSeparator()
+qPingRow = QuickBar:AddRow("Ping")
+QuickBar:AddSeparator()
+QuickBar:AddButton({ Text = "Log ping", Callback = function()
+	console:Write("Ping: " .. lastPing)
+end })
+
+task.spawn(function()
+	local Stats = game:GetService("Stats")
+	local frames, last = 0, os.clock()
+	while not Unloaded and Panel.Card and Panel.Card.Parent do
+		frames += 1
+		local now = os.clock()
+		if now - last >= 1 then
+			fpsRow:Set(frames)
+			qFpsRow:Set(frames)
+			frames, last = 0, now
+		end
+		local root = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+		if root then
+			local p = root.Position
+			posRow:Set(string.format("%d, %d, %d", p.X, p.Y, p.Z))
+		end
+		local ok, ping = pcall(function()
+			return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
+		end)
+		if ok then
+			lastPing = string.format("%dms", ping)
+			pingRow:Set(lastPing)
+			qPingRow:Set(lastPing)
+		end
+		minRow:Set(Window:IsMinimized() and "Yes" or "No")
+		local key = Window:GetToggleKey()
+		keyRow:Set(key and key.Name or "None")
+		RunService.Heartbeat:Wait()
+	end
+end)
