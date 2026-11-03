@@ -1,8 +1,8 @@
--- Vena's private Bypass -- Vehicle Dealership (single file, no key system)
+-- Vena's private Bypass -- Car Dealership Tycoon, place 1554960397 (single file, no key system)
 -- UI: VantixUI loaded below. The old Marco8642 remote UI lib is NOT used.
--- Logic: ported from the IronBrew3-obfuscated Vehicle Dealership script
--- (behaviorally reconstructed via sandbox tracing). No whitelist / key check anywhere.
--- Executor file used: cdtdelivery.txt ("<stars> <minReward> <maxReward>").
+-- Logic: re-ported to Car Dealership Tycoon from the game's own client sources
+-- (Knit remotes, Collectible components, AFKMode, RaceHandler tags,
+-- SpeedtrapController waypoints, DeliveryGame interact flow). No whitelist / key check anywhere.
 
 local VantixUI = nil
 do
@@ -25,6 +25,7 @@ local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService        = game:GetService("RunService")
 local UIS               = game:GetService("UserInputService")
+local CollectionService   = game:GetService("CollectionService")
 local VirtualUser       = game:GetService("VirtualUser")
 local LP                = Players.LocalPlayer
 
@@ -168,6 +169,41 @@ local function collectTarget(part, radius)
 	tryTouch(part)
 end
 
+-- CDT collectible pickup (Components.Collectible in the place file):
+-- stand within the group's CollectionRadius, then
+-- CollectibleServiceRemotes.Collect:InvokeServer(groupName, itemName).
+-- Group = tagged model's parent folder name; item = model name.
+local function collectGameItem(part)
+	if not part then return false end
+	local model = part
+	pcall(function()
+		local n = part
+		while n and n.Parent and n.Parent ~= workspace do
+			local okT, tagged = pcall(function() return CollectionService:HasTag(n, "Collectible_Model") end)
+			if okT and tagged then model = n break end
+			n = n.Parent
+		end
+	end)
+	local group, item
+	pcall(function() group = model.Parent and model.Parent.Name end)
+	pcall(function() item = model.Name end)
+	if not group or not item then return false end
+	local r = collectRadiusOf(group)
+	local okP, pp = pcall(function() return part.Position end)
+	if okP and pp then
+		local _, _, root = parts()
+		if root and (pp - root.Position).Magnitude > math.max(4, r - 2) then
+			moveTo(part.CFrame + Vector3.new(0, 3, 0))
+		end
+	end
+	fireNearbyPrompts(part.Position, 16)
+	tryTouch(part)
+	local rf = findRemote("Collect", "RemoteFunction")
+	if not rf then return false end
+	local ok, res = pcall(function() return rf:InvokeServer(group, item) end)
+	return ok and res
+end
+
 local function findVehicleOf(seat)
 	if not seat then return nil end
 	-- deobfuscated.lua trace saw SeatPart.Parent.Parent, but nesting varies:
@@ -213,6 +249,28 @@ local function moveTo(cf)
 		return true
 	end
 	return false
+end
+
+-- Real W-key hold (VirtualInputManager): some chassis ignore the seat's
+-- Throttle property and only answer real input, which is why the car can sit
+-- dead with Throttle = 1. Holding W covers those; Throttle = 1 stays as backup.
+local farmWDown = false
+local function farmPressW()
+	if farmWDown then return end
+	local focused = false
+	pcall(function() focused = UIS:GetFocusedTextBox() ~= nil end)
+	if focused then return end -- don't type "w" into boxes
+	farmWDown = true
+	pcall(function()
+		game:GetService("VirtualInputManager"):SendKeyEvent(true, Enum.KeyCode.W, false, game)
+	end)
+end
+local function farmReleaseW()
+	if not farmWDown then return end
+	farmWDown = false
+	pcall(function()
+		game:GetService("VirtualInputManager"):SendKeyEvent(false, Enum.KeyCode.W, false, game)
+	end)
 end
 
 local function hrpPos()
@@ -275,6 +333,9 @@ local function findCollectableFolders()
 	end
 	push(workspace:FindFirstChild("HalloweenPumpkinsLocal"))
 	push(workspace:FindFirstChild("Collectibles"))
+	push(workspace:FindFirstChild("Halloween2026"))
+	push(workspace:FindFirstChild("Halloween"))
+	push(workspace:FindFirstChild("Pickups"))
 	pcall(function()
 		for _, kid in ipairs(workspace:GetChildren()) do
 			if kid:IsA("Folder") or kid:IsA("Model") then
@@ -285,6 +346,72 @@ local function findCollectableFolders()
 	end)
 	return folders
 end
+
+-- ===== CDT remote resolver (Knit services move between updates) =====
+-- Resolve any RemoteEvent/RemoteFunction by (name, class) once, then cache.
+-- Falls back to a full re-scan when something replicates late.
+local RemoteMap = nil
+local function remoteMap()
+	if RemoteMap then return RemoteMap end
+	RemoteMap = {}
+	pcall(function()
+		for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+			pcall(function()
+				if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
+					RemoteMap[d.ClassName .. "\0" .. d.Name] = d
+				end
+			end)
+		end
+	end)
+	return RemoteMap
+end
+local function findRemote(name, class)
+	class = class or "RemoteEvent"
+	local hit = remoteMap()[class .. "\0" .. name]
+	if hit then return hit end
+	RemoteMap = nil -- replicated late? rescan once
+	return remoteMap()[class .. "\0" .. name]
+end
+
+-- Collectible group -> pickup radius (Databases.Collectibles in the place file)
+local CollectRadius = {
+	Halloween2026Pumpkins = 25,
+	Halloween2026 = 15,
+	EasterEgg2026 = 20,
+	Docks2025 = 20,
+	Test = 40,
+}
+local function collectRadiusOf(group)
+	return CollectRadius[group] or 15
+end
+
+-- AutoDrive car blacklist (Databases.AFKMode in the place file)
+local AutoDriveBlacklist = {
+	DeliveryTruck = true, DeliveryTruck2 = true, FireTruck = true,
+	TopFuel = true, TopFuelBike = true, TopFuelBike2 = true,
+	FunnyCar = true, FunnyCar2 = true, Limo = true, Limo2 = true,
+	ShoppingCart = true, BananaCar2 = true, Fiat6 = true, PlowTruck = true,
+	BoatCar = true, Reliant = true, SchoolBus = true, TourBus = true,
+	PumpkinMobile = true, Eggmobile = true, BurgerCar = true, Avtoros = true,
+	CandyBucket1 = true, Tesla6 = true, Dodge10 = true, Chevrolet10 = true,
+	Jeep4 = true, Dodge13 = true, Hennessey2 = true, Macchina16 = true,
+	MercedesBenz4 = true, MonsterTruck = true,
+	MonsterJam01 = true, MonsterJam02 = true, MonsterJam03 = true,
+	MonsterJam1 = true, MonsterJam2 = true, MonsterJam3 = true,
+	MonsterJam4 = true, MonsterJam5 = true, MonsterJam6 = true,
+	MonsterJam7 = true, MonsterJam8 = true, MonsterJam9 = true,
+	MonsterJam10 = true, MonsterJam11 = true, MonsterJam12 = true,
+	MonsterJam13 = true, MonsterJam14 = true, MonsterJam15 = true,
+	Porsche32 = true, Nissan11 = true, Nissan16 = true, Nissan9 = true,
+	BMW13 = true, Toyota8 = true, Toyota7 = true, Nissan5 = true,
+	Corvette4 = true, Toyota9 = true, Macchina10 = true, Nissan10 = true,
+	McLaren21 = true, ProStock = true, Nissan14 = true, Toyota11 = true,
+	ProMod = true, Dodge14 = true, Ferrari35 = true, Mini3 = true,
+	Brawlhalla1 = true, Brawlhalla2 = true, Brawlhalla3 = true,
+	Brawlhalla4 = true, Brawlhalla5 = true, Brawlhalla6 = true,
+	Brawlhalla7 = true, Brawlhalla8 = true, Brawlhalla9 = true,
+	Brawlhalla10 = true,
+}
 
 local function numericNameSort(list)
 	table.sort(list, function(a, b)
@@ -298,25 +425,7 @@ local function numericNameSort(list)
 	return list
 end
 
--- ===== 2. Delivery config (cdtdelivery.txt) =====
-local DeliveryConfig = { stars = 3, minReward = 5000, maxReward = 20000 }
-pcall(function()
-	local raw = readfile("cdtdelivery.txt") -- e.g. "3 5000 20000"
-	local split = raw:split(" ")
-	DeliveryConfig = {
-		stars     = tonumber(split[1]) or 3,
-		minReward = tonumber(split[2]) or 5000,
-		maxReward = tonumber(split[3]) or 20000,
-	}
-end)
-warn("_____________________________________Config Loaded_____________________________________\nStars: " .. tostring(DeliveryConfig.stars) .. "\nMinimum reward money: " .. tostring(DeliveryConfig.minReward) .. "\nMaximum reward money: " .. tostring(DeliveryConfig.maxReward))
 
--- ===== 3. Window =====
--- Live delivery values (deobfuscated.lua: Delivery-window boxes feed the same Auto Delivery;
--- Main toggle writes cdtdelivery.txt first). Declared here so BOTH delivery toggles use them.
-local StarAmount = DeliveryConfig.stars
-local MinReward = DeliveryConfig.minReward
-local MaxReward = DeliveryConfig.maxReward
 
 -- ===== 3. Window =====
 Window = VantixUI:CreateWindow({
@@ -328,7 +437,7 @@ Window = VantixUI:CreateWindow({
 })
 
 Window:CreateTag("Beta", Color3.fromRGB(240, 100, 100), nil, "flask-conical")
-Window:CreateTag("V2.3", Color3.fromRGB(60, 120, 210), nil, "git-branch")
+Window:CreateTag("V3.0", Color3.fromRGB(60, 120, 210), nil, "git-branch")
 
 Window:Notify({
 	Title    = "Vena's private Bypass",
@@ -386,6 +495,12 @@ local function buildSkyRoad()
 	local railMid = mid + Vector3.new(6, 0, 0)
 	mkPart("RailL", Vector3.new(SKY.LEN + 18, 6, 1), CFrame.new(railMid + Vector3.new(0, 4, SKY.WIDTH / 2)), Color3.fromRGB(200, 60, 60))
 	mkPart("RailR", Vector3.new(SKY.LEN + 18, 6, 1), CFrame.new(railMid + Vector3.new(0, 4, -SKY.WIDTH / 2)), Color3.fromRGB(200, 60, 60))
+	-- glowing center dashes: motion stays visible while gliding + helps aim.
+	for i = 0, 39 do
+		local dash = mkPart("Dash" .. i, Vector3.new(10, 0.2, 2), CFrame.new(Vector3.new(s.X + 30 + i * 54, topY + 0.11, s.Z)), Color3.fromRGB(255, 200, 40))
+		dash.CanCollide = false
+		pcall(function() dash.Material = Enum.Material.Neon end)
+	end
 	-- giant green platform 1000x1000 under the start of the road.
 	-- top sits 0.1 below the road top: visually the same level, no lip to
 	-- catch on, and no coplanar faces so nothing flickers.
@@ -396,9 +511,10 @@ local function buildSkyRoad()
 	mkPart("SlabN", Vector3.new(1000, 10, 1), CFrame.new(Vector3.new(px, py, pz - 500)), Color3.fromRGB(200, 60, 60))
 	mkPart("SlabS", Vector3.new(1000, 10, 1), CFrame.new(Vector3.new(px, py, pz + 500)), Color3.fromRGB(200, 60, 60))
 	mkPart("SlabW", Vector3.new(1, 10, 1000), CFrame.new(Vector3.new(px - 500, py, pz)), Color3.fromRGB(200, 60, 60))
-	-- east wall split in two so the road (26 wide) exits the slab through a gap
-	mkPart("SlabE1", Vector3.new(1, 10, 487), CFrame.new(Vector3.new(px + 500, py, pz - 256.5)), Color3.fromRGB(200, 60, 60))
-	mkPart("SlabE2", Vector3.new(1, 10, 487), CFrame.new(Vector3.new(px + 500, py, pz + 256.5)), Color3.fromRGB(200, 60, 60))
+	-- east wall split in two so the road exits the slab through a WIDE (80)
+	-- gap: an exact road-width gap wedged the car into the wall on any drift.
+	mkPart("SlabE1", Vector3.new(1, 10, 460), CFrame.new(Vector3.new(px + 500, py, pz - 270)), Color3.fromRGB(200, 60, 60))
+	mkPart("SlabE2", Vector3.new(1, 10, 460), CFrame.new(Vector3.new(px + 500, py, pz + 270)), Color3.fromRGB(200, 60, 60))
 	Flags.SkyStart, Flags.SkyEnd, Flags.SkyLaps = s, e, 0
 	return s, e
 end
@@ -419,7 +535,7 @@ local MainTab = Window:AddTab("Main", "house")
 local status, console
 -- toggle refs for the farm<->traps exclusivity (farming traps needs ground
 -- driving; sky-road farming needs the sky: they cannot run together)
-local autoFarmToggle, trapsToggle
+local autoFarmToggle, milesToggle, trapsToggle
 
 local function report(name, state)
 	-- deobfuscated.lua has no status bar; fancyGui.lua pattern is status:Set + console:Write.
@@ -436,8 +552,8 @@ local autoDriveBox = MainTab:AddTextBox({
 	Default     = "100",
 	Callback    = function(text)
 		AutoDriveSpeed = tonumber(text) or AutoDriveSpeed
-		if Flags.AutoFarm then
-			notify("Speed box ignored while Auto Farm is on (farm just holds W)")
+		if Flags.AutoMiles then
+			-- glide reads AutoDriveSpeed live: while farming, the box is pace.
 			return
 		end
 		local seat = seatOf()
@@ -449,130 +565,232 @@ local autoDriveBox = MainTab:AddTextBox({
 
 autoFarmToggle = MainTab:AddToggle({
 	Title    = "Auto Farm",
-	Subtitle = "Sky road, holds W (speed box ignored)",
+	Subtitle = "Native AFK auto-drive (needs 25 drive miles)",
+	Icon     = "navigation",
+	Default  = false,
+	Callback = function(state)
+		Flags.AutoDrive = state
+		report("Auto Farm", state)
+		if state then
+			if Flags.AutoTraps and trapsToggle then
+				trapsToggle:Set(false)
+				notify("Auto Farm: paused Speed Traps (traps need ground driving)")
+			end
+			if Flags.AutoMiles and milesToggle then
+				milesToggle:Set(false)
+				notify("Auto Farm: paused Miles Grinder")
+			end
+		else
+			pcall(function()
+				local ex = findRemote("ExitAutoDrive", "RemoteEvent")
+				if ex then ex:FireServer() end
+			end)
+			return
+		end
+		if Flags._driveRunning then return end
+		Flags._driveRunning = true
+		task.spawn(function()
+			-- first owned, non-blacklisted car (PromptCarSelection order: Name, Id)
+			local carName, carId
+			pcall(function()
+				local gc = findRemote("GetOwnedCars", "RemoteFunction")
+				if gc then
+					local owned = gc:InvokeServer()
+					if typeof(owned) == "table" then
+						for _, c in pairs(owned) do
+							local okC, nm, id = pcall(function() return c.Name, c.Id end)
+							if okC and nm and not AutoDriveBlacklist[nm] then
+								carName, carId = nm, id
+								break
+							end
+						end
+					end
+				end
+			end)
+			if not carName then
+				notify("Auto Farm: no usable owned car (need 25+ drive miles first?)")
+				Flags.AutoDrive = false
+				Flags._driveRunning = false
+				return
+			end
+			local started = false
+			pcall(function()
+				local st = findRemote("StartAutoDrive", "RemoteFunction")
+				if st then started = st:InvokeServer(carName, carId) end
+			end)
+			if not started then
+				notify("Auto Farm: server refused (locked or already driving?)")
+				Flags.AutoDrive = false
+				Flags._driveRunning = false
+				return
+			end
+			pcall(function() console:Write("Auto Farm: cruising in " .. tostring(carName)) end)
+			while Flags.AutoDrive and not Unloaded do
+				pcall(function() status:Set("Status: Auto Farm - cruising (" .. tostring(carName) .. ")") end)
+				task.wait(5)
+			end
+			pcall(function()
+				local ex = findRemote("ExitAutoDrive", "RemoteEvent")
+				if ex then ex:FireServer() end
+			end)
+			Flags._driveRunning = false
+		end)
+	end,
+})
+
+milesToggle = MainTab:AddToggle({
+	Title    = "Drive Miles Grinder",
+	Subtitle = "Sky road glide, holds pace (speed box = pace)",
 	Icon     = "car",
 	Default  = false,
 	Callback = function(state)
-		Flags.AutoFarm = state
-		report("Auto Farm", state)
+		Flags.AutoMiles = state
+		report("Miles Grinder", state)
 		if state and Flags.AutoTraps and trapsToggle then
 			trapsToggle:Set(false)
-			notify("Auto Farm: paused Speed Traps (they need ground driving)")
+			notify("Miles Grinder: paused Speed Traps (they need ground driving)")
+		end
+		if state and Flags.AutoDrive and autoFarmToggle then
+			autoFarmToggle:Set(false)
+			notify("Miles Grinder: paused Auto Farm")
 		end
 		if not state then
+			farmReleaseW()
 			local seat = seatOf()
 			if seat and seat:IsA("VehicleSeat") then pcall(function() seat.ThrottleFloat = 0 end) end
 			return
 		end
-		if Flags._farmRunning then return end
-		Flags._farmRunning = true
+		if Flags._milesRunning then return end
+		Flags._milesRunning = true
 		task.spawn(function()
 			local s, e = buildSkyRoad()
 			local cf = skyStartCF()
 			if cf then moveTo(cf) end
 			task.wait(0.5)
-			notify("Sky road ready - sit in a vehicle to farm (holds W, speed box ignored)")
+			-- Glide drive: deterministic, physics-independent. Every render step
+			-- moves the car +X at AutoDriveSpeed, locked to mid-road, hovering 1
+			-- stud above the top, facing +X. Nothing to get stuck on, no chassis
+			-- or input dependence. The speed box is the glide pace.
+			farmReleaseW() -- W-hold era over; the glide owns motion now
+			notify("Sky road ready - sit in a vehicle, it glides by itself (speed box = pace)")
 			pcall(function() console:Write("Sky road: " .. tostring(math.floor(s.Y)) .. " studs up, length " .. SKY.LEN) end)
 			local warnedSeat = false
-			local errs = 0
-			local dirX0, dirT0, dirDone = nil, os.clock(), false
-			local stuckX, stuckT = nil, os.clock()
-			while Flags.AutoFarm and not Unloaded do
-				local ok = pcall(function()
-					if not Flags.SkyStart or not Flags.SkyEnd then
-						s, e = buildSkyRoad()
-					end
+			local vehParts, lastVeh, hbConn = nil, nil, nil
+			Flags.SkyT0, Flags.SkyTotal, Flags.SkyRampT0 = os.clock(), 0, nil
+			hbConn = RunService.Heartbeat:Connect(function(dt)
+				if not Flags.AutoMiles or Unloaded then return end
+				pcall(function()
+					if not Flags.SkyStart then return end
 					local seat = seatOf()
-					if seat and seat:IsA("VehicleSeat") then
-						-- farm never touches MaxSpeed while on: the car just
-						-- holds W (Throttle = 1), straight ahead, on its own tune.
+					local vehicle = seat and findVehicleOf(seat)
+					if not (seat and vehicle) then
+						if not warnedSeat then
+							warnedSeat = true
+							notify("Miles Grinder: sit in a vehicle - you are parked on the sky road")
+						end
+						return
+					end
+					if vehicle ~= lastVeh then lastVeh, vehParts = vehicle, nil end
+					if not vehParts then
+						vehParts = {}
 						pcall(function()
-							seat.ThrottleFloat = 1
-							seat.SteerFloat = 0
+							for _, p in ipairs(vehicle:GetDescendants()) do
+								if p:IsA("BasePart") then table.insert(vehParts, p) end
+							end
 						end)
-					elseif not warnedSeat then
-						warnedSeat = true
-						notify("Auto Farm: sit in a vehicle - you are parked on the sky road")
 					end
-					local _, _, root = parts()
-					if not root then task.wait(1) return end
-					local pos = root.Position
-					local doneX = pos.X - Flags.SkyStart.X
-					local nearEdge = doneX >= (SKY.LEN - SKY.EDGE)
-					local fell = pos.Y < (Flags.SkyStart.Y - 80)
-					local lost = (pos - Flags.SkyStart).Magnitude > (SKY.LEN + 400)
-					if not dirDone then
-						if not dirX0 then
-							dirX0, dirT0 = pos.X, os.clock()
-						elseif (os.clock() - dirT0) > 3 then
-							dirDone = true
-							if pos.X < dirX0 - 5 then
-								-- car is driving backwards off the pad: flip it 180
-								local seatB = seatOf()
-								local vb = seatB and findVehicleOf(seatB)
-								if vb then
-									local okP, pv = pcall(function() return vb:GetPivot() end)
-									if okP and pv then
-										pcall(function() vb:PivotTo(CFrame.lookAt(pv.Position, pv.Position - pv.LookVector)) end)
-										pcall(function() console:Write("Auto Farm: car faced backwards, flipped it") end)
-									end
-								end
-							end
+					local topY = Flags.SkyStart.Y + 1
+					local cz = Flags.SkyStart.Z
+					local okP, pv = pcall(function() return vehicle:GetPivot() end)
+					if not okP or not pv then return end
+					local px = pv.Position.X
+					local doneX = px - Flags.SkyStart.X
+					if px < Flags.SkyStart.X or doneX >= (SKY.LEN - SKY.EDGE) or pv.Position.Y < (Flags.SkyStart.Y - 80) or (pv.Position - Flags.SkyStart).Magnitude > (SKY.LEN + 400) then
+						if doneX >= (SKY.LEN - SKY.EDGE) then
+							Flags.SkyLaps = (Flags.SkyLaps or 0) + 1
+							pcall(function() console:Write("Miles Grinder: lap " .. tostring(Flags.SkyLaps)) end)
 						end
-					end
-					local seated = seat and seat:IsA("VehicleSeat")
-					-- grinding a guard rail pushes Z off-center: pull back to
-					-- mid-road (keeps X progress, 1 stud above the top).
-					if seated and Flags.SkyStart and math.abs(pos.Z - Flags.SkyStart.Z) > 8 and not (nearEdge or fell or lost) then
-						local cy = Flags.SkyStart.Y + 2
-						local cz = Flags.SkyStart.Z
-						local cx = pos.X + 2
-						moveTo(CFrame.lookAt(Vector3.new(cx, cy, cz), Vector3.new(cx + 10, cy, cz)))
-						stuckX, stuckT = cx, os.clock()
-						pos = Vector3.new(cx, cy, cz)
-						doneX = pos.X - Flags.SkyStart.X
-					end
-					-- fully stuck (leaning on something, W held but no forward
-					-- motion): lift 1 stud above the top and nudge onward.
-					if seated and not (nearEdge or fell or lost) then
-						if not stuckX then
-							stuckX, stuckT = pos.X, os.clock()
-						elseif (os.clock() - stuckT) > 4 then
-							if pos.X < stuckX + 3 then
-								local cy2 = Flags.SkyStart.Y + 2
-								local cz2 = Flags.SkyStart.Z
-								local cx2 = pos.X + 5
-								moveTo(CFrame.lookAt(Vector3.new(cx2, cy2, cz2), Vector3.new(cx2 + 10, cy2, cz2)))
-								pcall(function() console:Write("Auto Farm: unstuck nudge") end)
-								pos = Vector3.new(cx2, cy2, cz2)
-								doneX = pos.X - Flags.SkyStart.X
-							end
-							stuckX, stuckT = pos.X, os.clock()
-						end
-					end
-					if nearEdge or fell or lost then
 						local startCF = skyStartCF()
-						if startCF then moveTo(startCF) end
-						Flags.SkyLaps = (Flags.SkyLaps or 0) + 1
-						task.wait(0.4)
-					else
-						local done = math.clamp(doneX, 0, SKY.LEN)
-						pcall(function()
-							status:Set(string.format("Status: Auto Farm - lap %d, %d/%d studs", Flags.SkyLaps or 0, math.floor(done), SKY.LEN))
-						end)
-						task.wait(0.2)
+						if startCF then
+							pcall(function() vehicle:PivotTo(startCF) end)
+							if vehParts then for _, p in ipairs(vehParts) do pcall(function() p.AssemblyLinearVelocity = Vector3.zero p.AssemblyAngularVelocity = Vector3.zero end) end end
+						end
+						return
 					end
+					-- manual override: holding S/A/D/Space yields the glide to you.
+					local held = false
+					pcall(function()
+						held = UIS:IsKeyDown(Enum.KeyCode.S) or UIS:IsKeyDown(Enum.KeyCode.A) or UIS:IsKeyDown(Enum.KeyCode.D) or UIS:IsKeyDown(Enum.KeyCode.Space)
+					end)
+					if held then return end
+					-- soft start: ease 15% -> full pace over the first 3 seated seconds.
+					if not Flags.SkyRampT0 then Flags.SkyRampT0 = os.clock() end
+					local pace = math.clamp(tonumber(AutoDriveSpeed) or 100, 10, 1000) * math.clamp((os.clock() - Flags.SkyRampT0) / 3, 0.15, 1)
+					local step = pace * math.min(dt, 0.1)
+					Flags.SkyTotal = (Flags.SkyTotal or 0) + step
+					local nx = px + step
+					pcall(function() vehicle:PivotTo(CFrame.lookAt(Vector3.new(nx, topY + 1, cz), Vector3.new(nx + 10, topY + 1, cz))) end)
+					if vehParts then for _, p in ipairs(vehParts) do pcall(function() p.AssemblyLinearVelocity = Vector3.zero p.AssemblyAngularVelocity = Vector3.zero end) end end
+					local _, _, hroot = parts()
+					if hroot then pcall(function() hroot.AssemblyLinearVelocity = Vector3.zero hroot.AssemblyAngularVelocity = Vector3.zero end) end
+					local done = math.clamp(nx - Flags.SkyStart.X, 0, SKY.LEN)
+					pcall(function() status:Set(string.format("Status: Miles Grinder - lap %d, %d/%d studs @ %d", Flags.SkyLaps or 0, math.floor(done), SKY.LEN, math.floor(pace))) end)
 				end)
-				if ok then errs = 0 else errs += 1 end
-				if errs >= 15 then
-					Flags.AutoFarm = false
-					notify("Auto Farm stopped: 15 errors in a row")
-					break
+			end)
+			while Flags.AutoMiles and not Unloaded do
+				task.wait(1)
+				if not Flags.SkyStart or not Flags.SkyEnd then s, e = buildSkyRoad() end
+				-- respawn recovery: on foot and far below the road (died / fell off)
+				-- while the farm is on -> lift back onto the pad. Seated cases are
+				-- handled by the glide itself (it teleports the car up).
+				-- no-progress watchdog (5s window): reset cleanly if gliding but
+				-- barely advancing (ownership hiccup, weld jam). Skipped while
+				-- you override manually (S/A/D/Space).
+				if Flags.SkyStart then
+					pcall(function()
+						local seatW = seatOf()
+						local vehW = seatW and findVehicleOf(seatW)
+						if not (seatW and vehW) then Flags.SkyWatchX, Flags.SkyWatchT = nil, nil return end
+						local heldW = false
+						pcall(function()
+							heldW = UIS:IsKeyDown(Enum.KeyCode.S) or UIS:IsKeyDown(Enum.KeyCode.A) or UIS:IsKeyDown(Enum.KeyCode.D) or UIS:IsKeyDown(Enum.KeyCode.Space)
+						end)
+						if heldW then Flags.SkyWatchX, Flags.SkyWatchT = nil, nil return end
+						local nowW = os.clock()
+						local okP, pv = pcall(function() return vehW:GetPivot() end)
+						if not okP or not pv then return end
+						if not Flags.SkyWatchX then Flags.SkyWatchX, Flags.SkyWatchT = pv.Position.X, nowW return end
+						if (nowW - (Flags.SkyWatchT or nowW)) >= 5 then
+							local paceW = math.clamp(tonumber(AutoDriveSpeed) or 100, 10, 1000)
+							if pv.Position.X < Flags.SkyWatchX + paceW * 2 then
+								local startCF = skyStartCF()
+								if startCF then pcall(function() vehW:PivotTo(startCF) end) end
+								pcall(function() console:Write("Miles Grinder: no progress, reset to start") end)
+							end
+							Flags.SkyWatchX, Flags.SkyWatchT = pv.Position.X, nowW
+						end
+					end)
 				end
+				if Flags.SkyStart and not seatOf() then
+					local _, _, r = parts()
+					if r and r.Position.Y < (Flags.SkyStart.Y - 80) then
+						local backCF = skyStartCF()
+						if backCF then moveTo(backCF) end
+					end
+				end
+			end
+			pcall(function() if hbConn then hbConn:Disconnect() end end)
+			hbConn = nil
+			do
+				local laps = Flags.SkyLaps or 0
+				local total = math.floor(Flags.SkyTotal or 0)
+				local secs = math.floor(os.clock() - (Flags.SkyT0 or os.clock()))
+				pcall(function() console:Write(string.format("Miles Grinder session: %d laps, %d studs in %ds", laps, total, secs)) end)
 			end
 			local seat = seatOf()
 			if seat and seat:IsA("VehicleSeat") then pcall(function() seat.ThrottleFloat = 0 end) end
-			Flags._farmRunning = false
+			farmReleaseW()
+			Flags._milesRunning = false
 		end)
 	end,
 })
@@ -647,18 +865,7 @@ MainTab:AddToggle({
 						for _, part in ipairs(targets) do
 							if not Flags.AutoPumpkins or Unloaded then break end
 							local okItem = pcall(function()
-								collectTarget(part, 16)
-								-- deobfuscated.lua: Collectibles.Halloween2026Pumpkins(.Roll)
-								-- touched at startup; try Roll whenever we touch anything.
-								pcall(function()
-									local db = Collectibles and Collectibles.Halloween2026Pumpkins
-									local roll = db and db.Roll
-									if type(roll) == "function" then
-										roll(db)
-									elseif roll and roll.InvokeServer then
-										roll:InvokeServer()
-									end
-								end)
+									collectGameItem(part) -- CDT: Collect:InvokeServer(group, item) within radius
 							end)
 							if okItem then pumpErrs = 0 else pumpErrs += 1 end
 							if pumpErrs >= 15 then
@@ -710,7 +917,7 @@ MainTab:AddToggle({
 						local okItem = pcall(function()
 							if d:IsA("BasePart") then
 								found = true
-								collectTarget(d, 16)
+							collectGameItem(d) -- CDT: Collect:InvokeServer(group, item) within radius
 							end
 						end)
 						if okItem then colErrs = 0 else colErrs += 1 end
@@ -742,7 +949,7 @@ MainTab:AddToggle({
 		task.spawn(function()
 			while Flags.AutoKit and not Unloaded do
 				pcall(function()
-					ReplicatedStorage.Remotes.Services.CarKitEventServiceRemotes.ClaimFreePack:InvokeServer()
+					do local kit = findRemote("ClaimFreePack", "RemoteFunction") if kit then kit:InvokeServer() end end -- TypedRemote order: Function
 				end)
 				task.wait(3)
 			end
@@ -752,94 +959,125 @@ MainTab:AddToggle({
 })
 
 MainTab:AddToggle({
-	Title    = "Auto Extinguish Fire",
-	Subtitle = "Equips + uses the fire tool",
+	Title    = "Auto Claim Rewards",
+	Subtitle = "Claims daily/gift/objective rewards",
 	Icon     = "flame",
 	Default  = false,
 	Callback = function(state)
 		Flags.AutoFire = state
-		report("Auto Extinguish Fire", state)
+		report("Auto Claim Rewards", state)
 		if not state or Flags._fireRunning then return end
 		Flags._fireRunning = true
 		task.spawn(function()
 			while Flags.AutoFire and not Unloaded do
+				-- CDT has no fire tools: this claims every free/time-based reward instead.
+				-- (DailyReward + Objective are events; FreeGift + NextReward are functions.)
+				local claimed = 0
 				pcall(function()
-					local char, hum, root = parts()
-					if not hum then return end
-					-- deobfuscated.lua trace: Backpack:FindFirstChildOfClass("Tool"),
-					-- Humanoid:EquipTool, HumanoidRootPart
-					local _hrp = root and root.Position
-					local tool
-					for _, t in ipairs(LP.Backpack:GetChildren()) do
-						if t:IsA("Tool") and (t.Name:lower():find("extinguish") or t.Name:lower():find("fire")) then
-							tool = t
-							break
-						end
-					end
-					if tool and tool.Parent then
-						hum:EquipTool(tool)
-						task.wait(0.25)
-						if tool.Parent == char then pcall(function() tool:Activate() end) end
-					else
-						pcall(function() status:Set("Status: Extinguish - no fire tool, waiting") end)
-					end
+					local r1 = findRemote("ClaimDailyReward", "RemoteEvent")
+					if r1 then r1:FireServer() end
 				end)
-				task.wait(1)
+				pcall(function()
+					local r2 = findRemote("ClaimObjective", "RemoteEvent")
+					if r2 then r2:FireServer() end
+				end)
+				pcall(function()
+					local r3 = findRemote("ClaimFreeGift", "RemoteFunction")
+					if r3 then r3:InvokeServer() end
+				end)
+				pcall(function()
+					local r4 = findRemote("ClaimNextReward", "RemoteEvent")
+					if r4 then r4:FireServer() end
+				end)
+				claimed += 1
+				pcall(function()
+					status:Set("Status: Claim Rewards - pass " .. claimed .. " (60s cycle)")
+				end)
+				task.wait(60)
 			end
 			Flags._fireRunning = false
 		end)
 	end,
 })
 
+local SellCarName = "" -- exact owned car to sell; blank = feature off
+MainTab:AddTextBox({
+	Title       = "Auto Sell Car Name",
+	Icon        = "tag",
+	Placeholder = "Exact car name to auto-sell...",
+	Default     = "",
+	Callback    = function(text)
+		SellCarName = text
+	end,
+})
+
 MainTab:AddToggle({
 	Title    = "Auto Sell Cars",
-	Subtitle = "Teleports through the sell point",
+	Subtitle = "Auto-serves dealership customers",
 	Icon     = "dollar-sign",
 	Default  = false,
 	Callback = function(state)
 		Flags.AutoSell = state
 		report("Auto Sell Cars", state)
 		if not state or Flags._sellRunning then return end
-		local sellPart
-		pcall(function()
-			local checked = 0
-			for _, d in ipairs(workspace:GetDescendants()) do
-				checked += 1
-				if checked > 30000 then break end
-				local okS, isP = pcall(function() return d:IsA("BasePart") end)
-				if okS and isP then
-					local okN, n = pcall(function() return d.Name:lower() end)
-					if okN and n and n:find("sell") then
-						sellPart = d
-						break
-					end
-				end
-			end
-		end)
-		if not sellPart then
-			notify("No sell point found (looked for *sell*)")
-			pcall(function() status:Set("Status: Auto Sell - no *sell* part") end)
+		if not SellCarName or SellCarName == "" then
+			notify("Auto Sell: enter the exact car name first")
 			Flags.AutoSell = false
 			return
 		end
-		pcall(function()
-			console:Write("Auto Sell point: " .. sellPart:GetFullName())
-			status:Set("Status: Auto Sell - " .. sellPart.Name)
-		end)
 		Flags._sellRunning = true
 		task.spawn(function()
 			local sellErrs = 0
 			while Flags.AutoSell and not Unloaded do
 				local okSell = pcall(function()
-					collectTarget(sellPart, 16)
+				-- own tycoon: Tycoons child whose Owner is me
+				local myTycoon
+				pcall(function()
+				for _, t in ipairs(workspace.Tycoons:GetChildren()) do
+				local okO, o = pcall(function() return t.Owner.Value end)
+				if okO and o == LP.Name then myTycoon = t break end
+				end
+				end)
+				if not myTycoon then
+				pcall(function() status:Set("Status: Auto Sell - no tycoon found") end)
+				return
+				end
+				-- customers are models carrying an OrderId attribute
+				local npc, oid
+				pcall(function()
+				for _, d in ipairs(myTycoon:GetDescendants()) do
+				local okA, id = pcall(function() return d:GetAttribute("OrderId") end)
+				if okA and id then
+				local m = d
+				while m and not m:IsA("Model") do m = m.Parent end
+				if m then npc, oid = m, id break end
+				end
+				end
+				end)
+				if not npc then
+				pcall(function() status:Set("Status: Auto Sell - waiting for customers") end)
+				return
+				end
+				local npcR = findRemote("NPCHandler", "RemoteEvent")
+				if not npcR then return end
+				pcall(function() npcR:FireServer({ Action = "AcceptOrder", OrderId = oid }) end)
+				task.wait(1)
+				pcall(function()
+				npcR:FireServer({
+				Action = "CompleteOrder",
+				OrderId = oid,
+				Specs = { Car = SellCarName, Color = "Red", Rims = "Default", RimColor = "Black", Springs = "Default" },
+				})
+				end)
+				pcall(function() status:Set("Status: Auto Sell - served order " .. tostring(oid)) end)
 				end)
 				if okSell then sellErrs = 0 else sellErrs += 1 end
 				if sellErrs >= 15 then
-					Flags.AutoSell = false
-					notify("Auto Sell stopped: sell point invalid, re-toggle to rescan")
-					break
+				Flags.AutoSell = false
+				notify("Auto Sell stopped: 15 errors in a row")
+				break
 				end
-				task.wait(1.2)
+				task.wait(3)
 			end
 			Flags._sellRunning = false
 		end)
@@ -866,14 +1104,25 @@ trapsToggle = MainTab:AddToggle({
 	Callback = function(state)
 		Flags.AutoTraps = state
 		report("Auto Speed Traps", state)
-		if state and Flags.AutoFarm and autoFarmToggle then
+		if state and Flags.AutoMiles and milesToggle then
+			milesToggle:Set(false)
+			notify("Speed Traps: paused sky-road Miles Grinder (traps need ground driving)")
+		end
+		if state and Flags.AutoDrive and autoFarmToggle then
 			autoFarmToggle:Set(false)
-			notify("Speed Traps: paused sky-road Auto Farm (traps need ground driving)")
+			notify("Speed Traps: paused Auto Farm (traps need ground driving)")
 		end
 		if not state or Flags._trapsRunning then return end
 		local folder = workspace:FindFirstChild("SpeedCameras")
 		if not folder then
-			notify("workspace.SpeedCameras not found")
+			pcall(function()
+				local a = ReplicatedStorage:FindFirstChild("Assets")
+				local w = a and a:FindFirstChild("Waypoints")
+				folder = w and w:FindFirstChild("SpeedTrapWaypoints")
+			end)
+		end
+		if not folder then
+			notify("No speed cameras or waypoints found")
 			Flags.AutoTraps = false
 			return
 		end
@@ -932,44 +1181,53 @@ trapsToggle = MainTab:AddToggle({
 	end,
 })
 
+-- CDT delivery = ActionTasksGames items (see InteractHandler): teleport to
+-- each *DeliveryGame* item and fire TryInteractWithItem for it.
+local function deliveryInteract()
+		local games = workspace:FindFirstChild("ActionTasksGames")
+		if not games then return false end
+		local item, gname
+		pcall(function()
+			for _, d in ipairs(games:GetDescendants()) do
+			if d:IsA("BasePart") then
+			local p = d.Parent
+			local okN, n = pcall(function() return p and p.Name or "" end)
+			if okN and n:find("DeliveryGame") then item, gname = d, n break end
+			end
+			end
+		end)
+		if not item then return false end
+		moveTo(item.CFrame + Vector3.new(0, 3, 0))
+		tryTouch(item)
+		fireNearbyPrompts(item.Position, 14)
+		local ar = findRemote("ActionGameDataReplication", "RemoteEvent")
+		if ar then pcall(function() ar:FireServer("TryInteractWithItem", { GameName = gname, ItemId = item.Name }) end) end
+		return true
+end
+
 MainTab:AddToggle({
 	Title    = "Auto Delivery",
-	Subtitle = "Runs deliveries (uses Delivery tab values)",
+	Subtitle = "Works DeliveryGame items automatically",
 	Icon     = "truck",
 	Default  = false,
 	Callback = function(state)
 		Flags.AutoDelivery = state
 		report("Auto Delivery", state)
 		if not state then return end
-		pcall(function()
-			writefile("cdtdelivery.txt", tostring(StarAmount) .. " " .. tostring(MinReward) .. " " .. tostring(MaxReward))
-		end)
 		if Flags._deliveryRunning then return end
 		Flags._deliveryRunning = true
 		task.spawn(function()
 			local warnedDel = false
 			while Flags.AutoDelivery and not Unloaded do
-					local ok = pcall(function()
-					-- deobfuscated.lua trace: Head, WaitForChild(Humanoid), Humanoid.Sit
-					-- Fixed: WaitForChild hangs forever if dead/respawning -> use instant lookup.
-					local char = LP.Character
-					local hum = char and char:FindFirstChildOfClass("Humanoid")
-					if hum and hum.Sit then
-						local seat = hum.SeatPart
-						if seat and seat:IsA("VehicleSeat") then
-							seat.MaxSpeed = AutoDriveSpeed
-							seat.ThrottleFloat = 1
-						end
-					else
-						if not warnedDel then
-							warnedDel = true
-							notify("Auto Delivery: sit in a vehicle")
-						end
-						pcall(function() status:Set("Status: Auto Delivery - waiting for vehicle") end)
-						task.wait(3)
-					end
-				end)
-				task.wait(1)
+				local didDel = false
+				pcall(function() didDel = deliveryInteract() end)
+				if didDel then
+					pcall(function() status:Set("Status: Auto Delivery - worked item") end)
+					task.wait(1)
+				else
+					pcall(function() status:Set("Status: Auto Delivery - no delivery items") end)
+					task.wait(3)
+				end
 			end
 			local seat = seatOf()
 			if seat and seat:IsA("VehicleSeat") then pcall(function() seat.ThrottleFloat = 0 end) end
@@ -990,8 +1248,15 @@ MainTab:AddToggle({
 			if not Flags._popupConn then
 				Flags._popupConn = LP.PlayerGui.ChildAdded:Connect(function(child)
 					pcall(function()
-						if child.Name:lower():find("popup") or child.Name:lower():find("announce") then
-							child:Destroy()
+						local n = child.Name:lower()
+						if n:find("popup") or n:find("announce") then
+							if n == "popup" then
+								child:Destroy()
+							elseif child:IsA("ScreenGui") then
+								child.Enabled = false
+							else
+								pcall(function() child.Visible = false end)
+							end
 						end
 					end)
 				end)
@@ -1028,7 +1293,7 @@ MainTab:AddButton({
 	Icon     = "octagon-x",
 	Text     = "Stop",
 	Callback = function()
-		for _, k in ipairs({ "AutoFarm", "AutoPumpkins", "AutoCollectibles", "AutoKit", "AutoFire", "AutoSell", "AutoTraps", "AutoDelivery", "AutoDelivery2", "AutoRace", "AutoDrift", "AutoLaps", "AutoDelux", "AutoCrate", "AutoEvent", "AutoBuy" }) do
+		for _, k in ipairs({ "AutoDrive", "AutoMiles", "AutoPumpkins", "AutoCollectibles", "AutoKit", "AutoFire", "AutoSell", "AutoTraps", "AutoDelivery", "AutoDelivery2", "AutoRace", "AutoDrift", "AutoLaps", "AutoDelux", "AutoCrate", "AutoEvent", "AutoBuy" }) do
 			Flags[k] = false
 		end
 		local seat = seatOf()
@@ -1036,6 +1301,7 @@ MainTab:AddButton({
 			seat.ThrottleFloat = 0
 			seat.SteerFloat = 0
 		end) end
+		farmReleaseW()
 		report("All loops", false)
 		pcall(function() status:Set("Status: all stopped") end)
 	end,
@@ -1050,96 +1316,31 @@ console:Write("Vena's private Bypass loaded")
 -- ===== 5. Delivery options =====
 local DeliveryTab = Window:AddTab("Delivery", "truck")
 
-DeliveryTab:AddLabel("Minimum Stars", "star")
+DeliveryTab:AddLabel("CDT delivery = ActionTasksGames items (auto-worked)", "truck")
 
-StarAmount = DeliveryConfig.stars -- outer live var (see top); deobfuscated.lua: edits feed Auto Delivery
-local starBox = DeliveryTab:AddTextBox({
-	Title       = "Enter Star Amount",
-	Icon        = "star",
-	Placeholder = "Enter Star Amount...",
-	Default     = tostring(DeliveryConfig.stars),
-	Callback    = function(text)
-		StarAmount = tonumber(text) or StarAmount
-		DeliveryConfig.stars = StarAmount
-	end,
-})
-
-DeliveryTab:AddLabel("Minimum Reward Money", "dollar-sign")
-
-MinReward = DeliveryConfig.minReward -- outer live var
-local minBox = DeliveryTab:AddTextBox({
-	Title       = "Enter Minimum Reward",
-	Icon        = "dollar-sign",
-	Placeholder = "Enter Minimum Reward...",
-	Default     = tostring(DeliveryConfig.minReward),
-	Callback    = function(text)
-		MinReward = tonumber(text) or MinReward
-		DeliveryConfig.minReward = MinReward
-	end,
-})
-
-DeliveryTab:AddLabel("Maximum Reward Money", "dollar-sign")
-
-MaxReward = DeliveryConfig.maxReward -- outer live var
-local maxBox = DeliveryTab:AddTextBox({
-	Title       = "Enter Maximum Reward",
-	Icon        = "dollar-sign",
-	Placeholder = "Enter Maximum Reward...",
-	Default     = tostring(DeliveryConfig.maxReward),
-	Callback    = function(text)
-		MaxReward = tonumber(text) or MaxReward
-		DeliveryConfig.maxReward = MaxReward
-	end,
-})
-
-DeliveryTab:AddButton({
-	Title    = "Save Delivery Config",
-	Subtitle = "Writes cdtdelivery.txt",
-	Icon     = "save",
-	Text     = "Save",
-	Callback = function()
-		pcall(function()
-			writefile("cdtdelivery.txt", tostring(StarAmount) .. " " .. tostring(MinReward) .. " " .. tostring(MaxReward))
-		end)
-		Window:Notify({ Title = "Config", Text = "Delivery config saved", Duration = 2 })
-	end,
-})
 
 DeliveryTab:AddToggle({
 	Title    = "Auto Delivery",
-	Subtitle = "Uses the values above",
+	Subtitle = "Works DeliveryGame items automatically",
 	Icon     = "truck",
 	Default  = false,
 	Callback = function(state)
 		Flags.AutoDelivery2 = state
 		report("Auto Delivery (Delivery tab)", state)
 		if not state or Flags._delivery2Running then return end
-		-- deobfuscated.lua: Delivery-window Auto Delivery writes the LIVE Star/Min/Max first
-		pcall(function()
-			writefile("cdtdelivery.txt", tostring(StarAmount) .. " " .. tostring(MinReward) .. " " .. tostring(MaxReward))
-		end)
 		Flags._delivery2Running = true
 		task.spawn(function()
 			local warnedDel2 = false
 			while Flags.AutoDelivery2 and not Unloaded do
-				pcall(function()
-					local char = LP.Character
-					local hum = char and char:FindFirstChildOfClass("Humanoid")
-					if hum and hum.Sit then
-						local seat = hum.SeatPart
-						if seat and seat:IsA("VehicleSeat") then
-							seat.MaxSpeed = AutoDriveSpeed
-							seat.ThrottleFloat = 1
-						end
-					else
-						if not warnedDel2 then
-							warnedDel2 = true
-							notify("Auto Delivery: sit in a vehicle")
-						end
-						pcall(function() status:Set("Status: Auto Delivery - waiting for vehicle") end)
-					end
-				end)
-				task.wait(1)
+				local didDel = false
+				pcall(function() didDel = deliveryInteract() end)
+				if didDel then
+					pcall(function() status:Set("Status: Auto Delivery - worked item") end)
+					task.wait(1)
+				else
+					pcall(function() status:Set("Status: Auto Delivery - no delivery items") end)
+					task.wait(3)
+				end
 			end
 			local seat = seatOf()
 			if seat and seat:IsA("VehicleSeat") then pcall(function() seat.ThrottleFloat = 0 end) end
@@ -1159,8 +1360,25 @@ local function collectRaceParts(raceRoot)
 	local key = tostring(raceRoot:GetFullName())
 	if RaceCache[key] then return RaceCache[key] end
 	local strict, fallback = {}, {}
+	-- CDT tags the real gates: RaceHandler reads GetTagged("Checkpoints"/"GoalCheckpoints")
+	pcall(function()
+		for _, tag in ipairs({ "Checkpoints", "GoalCheckpoints" }) do
+			local okT, tagged = pcall(function() return CollectionService:GetTagged(tag) end)
+			if okT and tagged then
+				for _, inst in ipairs(tagged) do
+					local okD, inside = pcall(function() return inst:IsDescendantOf(raceRoot) end)
+					if okD and inside then
+						local okP, isP = pcall(function() return inst:IsA("BasePart") end)
+						if okP and isP and #strict < 150 then table.insert(strict, inst) end
+					end
+				end
+			end
+		end
+	end)
 	local descs = {}
-	pcall(function() descs = raceRoot:GetDescendants() end)
+	if #strict == 0 then
+		pcall(function() descs = raceRoot:GetDescendants() end)
+	end
 	for _, d in ipairs(descs) do
 		local okIs = false
 		pcall(function() okIs = d:IsA("BasePart") end)
@@ -1320,6 +1538,14 @@ RaceTab:AddButton({
 		end
 		SelectedRace = root.Name
 		pcall(function() targetRaceDropdown:SetOptions(getRaceList()) end)
+		pcall(function()
+			if Flags.RaceTeleportDropdown then
+				local extra = {}
+				for _, n in ipairs(getRaceList()) do if n ~= "All" then table.insert(extra, n) end end
+				if #extra == 0 then extra = { "None" } end
+				Flags.RaceTeleportDropdown:SetOptions(extra)
+			end
+		end)
 		collectRacePoint(cps[1])
 		pcall(function()
 			console:Write("Halloween race: " .. root:GetFullName() .. " (" .. #cps .. " points)")
@@ -1337,6 +1563,14 @@ RaceTab:AddButton({
 		clearRaceCache()
 		local names = getRaceList()
 		pcall(function() targetRaceDropdown:SetOptions(names) end)
+		pcall(function()
+			if Flags.RaceTeleportDropdown then
+				local extra = {}
+				for _, n in ipairs(getRaceList()) do if n ~= "All" then table.insert(extra, n) end end
+				if #extra == 0 then extra = { "None" } end
+				Flags.RaceTeleportDropdown:SetOptions(extra)
+			end
+		end)
 		pcall(function() console:Write("Races found: " .. table.concat(names, ", ")) end)
 	end,
 })
@@ -1602,13 +1836,14 @@ pcall(function()
 	end
 end)
 
-MiscTab:AddDropdown({
+local raceTeleportDropdown = MiscTab:AddDropdown({
 	Title    = "Race Teleport",
 	Icon     = "map-pin",
 	Options  = raceNames,
 	Default  = "None",
 	Callback = function(selected)
 		if selected == "None" then return end
+		SelectedRace = selected
 		pcall(function()
 			local dest = findRaceRootByName(selected)
 			local part = firstPart(dest)
@@ -1620,6 +1855,7 @@ MiscTab:AddDropdown({
 		pcall(function() status:Set("Status: teleported " .. tostring(selected)) end)
 	end,
 })
+Flags.RaceTeleportDropdown = raceTeleportDropdown
 
 MiscTab:AddToggle({
 	Title    = "Auto Open Delux Custom Crate",
@@ -1631,9 +1867,9 @@ MiscTab:AddToggle({
 		if not state or Flags._deluxRunning then return end
 		Flags._deluxRunning = true
 		task.spawn(function()
-			local remote = ReplicatedStorage.Remotes.Services.ConsumableServiceRemotes.Consume
+			local remote = findRemote("Consume", "RemoteFunction")
 			while Flags.AutoDelux and not Unloaded do
-				pcall(function() remote:InvokeServer("DecorationKitDeluxe") end)
+				pcall(function() if remote then remote:InvokeServer("DecorationKitDeluxe") end end)
 				task.wait(3)
 			end
 			Flags._deluxRunning = false
@@ -1651,9 +1887,9 @@ MiscTab:AddToggle({
 		if not state or Flags._crateRunning then return end
 		Flags._crateRunning = true
 		task.spawn(function()
-			local remote = ReplicatedStorage.Remotes.Services.ConsumableServiceRemotes.Consume
+			local remote = findRemote("Consume", "RemoteFunction")
 			while Flags.AutoCrate and not Unloaded do
-				pcall(function() remote:InvokeServer("DecorationKit") end)
+				pcall(function() if remote then remote:InvokeServer("DecorationKit") end end)
 				task.wait(3)
 			end
 			Flags._crateRunning = false
@@ -1671,9 +1907,9 @@ MiscTab:AddToggle({
 		if not state or Flags._eventRunning then return end
 		Flags._eventRunning = true
 		task.spawn(function()
-			local remote = ReplicatedStorage.Remotes.Services.ConsumableServiceRemotes.Consume
+			local remote = findRemote("Consume", "RemoteFunction")
 			while Flags.AutoEvent and not Unloaded do
-				pcall(function() remote:InvokeServer("DecorationKitHalloween") end)
+				pcall(function() if remote then remote:InvokeServer("DecorationKitHalloween") end end)
 				task.wait(3)
 			end
 			Flags._eventRunning = false
@@ -1691,9 +1927,9 @@ MiscTab:AddToggle({
 		if not state or Flags._buyRunning then return end
 		Flags._buyRunning = true
 		task.spawn(function()
-			local shop = ReplicatedStorage.Databases.HalloweenEvent.PurchaseShopItem
+			local shop = findRemote("PurchaseShopItem", "RemoteFunction")
 			while Flags.AutoBuy and not Unloaded do
-				pcall(function() shop:InvokeServer("HalloweenKit") end)
+				pcall(function() if shop then shop:InvokeServer("HalloweenKit") end end)
 				task.wait(3)
 			end
 			Flags._buyRunning = false
@@ -1781,9 +2017,6 @@ Window.ConfigManager:SetFolder("VenasBypass")
 local function buildConfig(name)
 	local cfg = Window.ConfigManager:CreateConfig(name)
 	cfg:RegisterElement("AutoDriveSpeed", autoDriveBox)
-	cfg:RegisterElement("StarAmount", starBox)
-	cfg:RegisterElement("MinReward", minBox)
-	cfg:RegisterElement("MaxReward", maxBox)
 	cfg:RegisterElement("RaceSpeed", raceSpeedBox)
 	cfg:RegisterElement("TargetRace", targetRaceDropdown)
 	cfg:RegisterElement("TrapMode", trapModeDropdown)
@@ -1879,7 +2112,8 @@ SettingsTab:AddButton({
 	Text     = "Unload",
 	Callback = function()
 		Unloaded = true
-		Flags.AutoFarm = false
+		Flags.AutoDrive = false
+		Flags.AutoMiles = false
 		Flags.AutoPumpkins = false
 		Flags.AutoCollectibles = false
 		Flags.AutoKit = false
@@ -1898,6 +2132,7 @@ SettingsTab:AddButton({
 		if zoomConn then zoomConn:Disconnect() end
 		if Flags._popupConn then pcall(function() Flags._popupConn:Disconnect() end) Flags._popupConn = nil end
 		pcall(function() destroySkyRoad() end)
+		farmReleaseW()
 		Panel:Destroy()
 		QuickBar:Destroy()
 		Window:Destroy()
