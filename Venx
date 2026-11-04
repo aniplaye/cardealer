@@ -1937,7 +1937,327 @@ MiscTab:AddToggle({
 	end,
 })
 
--- ===== 8. Settings (no key system) =====
+-- ===== 8. Exploits (probes + confirmed; nothing here loops on its own) =====
+local ExploitsTab = Window:AddTab("Exploits", "bug")
+
+ExploitsTab:AddLabel("Confirmed exploits: none yet - run the probes, paste output back", "flask-conical")
+
+local ExploitOrderId = ""
+ExploitsTab:AddTextBox({
+	Title       = "Exploit OrderId",
+	Icon        = "key",
+	Placeholder = "Other player's OrderId (opt-in test)...",
+	Default     = "",
+	Callback    = function(text)
+		ExploitOrderId = text
+	end,
+})
+
+local function xReport(name, line)
+	pcall(function() console:Write("[XHUNT] " .. name .. ": " .. tostring(line)) end)
+end
+
+ExploitsTab:AddButton({
+	Title    = "Dump Remote Surface",
+	Subtitle = "Lists every remote (recon, paste it back)",
+	Icon     = "list",
+	Text     = "Dump",
+	Callback = function()
+		task.spawn(function()
+			local ev, fn = {}, {}
+			pcall(function()
+				for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+					pcall(function()
+						if d:IsA("RemoteEvent") then table.insert(ev, d:GetFullName())
+						elseif d:IsA("RemoteFunction") then table.insert(fn, d:GetFullName()) end
+					end)
+				end
+			end)
+			pcall(function()
+				table.sort(ev) table.sort(fn)
+				local lines = { "XHUNT remote dump: " .. #ev .. " events, " .. #fn .. " functions" }
+				for _, n in ipairs(ev) do table.insert(lines, "EV " .. n) end
+				for _, n in ipairs(fn) do table.insert(lines, "FN " .. n) end
+				local blob = table.concat(lines, "\n")
+				console:Write(blob)
+				pcall(function() writefile("venas_remote_dump.txt", blob) end)
+				notify("Remote dump saved (console + venas_remote_dump.txt)")
+				status:Set("Status: Exploits - dumped " .. (#ev + #fn) .. " remotes")
+			end)
+		end)
+	end,
+})
+
+ExploitsTab:AddButton({
+	Title    = "Probe: Far Collect",
+	Subtitle = "Collects a 150+ stud item without moving",
+	Icon     = "play",
+	Text     = "Run",
+	Callback = function()
+		task.spawn(function()
+			local _, _, root = parts()
+			if not root then notify("XHUNT: no character") return end
+			local me = root.Position
+			local best, bestD, bestGroup = nil, 150, nil
+			pcall(function()
+				for _, d in ipairs(workspace:GetDescendants()) do
+					local okT = false
+					pcall(function() okT = CollectionService:HasTag(d, "Collectible_Model") end)
+					if okT then
+						local okP, pp = pcall(function() return d:GetPivot().Position end)
+						if okP and pp then
+							local dist = (pp - me).Magnitude
+							if dist > bestD then best, bestD, bestGroup = d, dist, d.Parent and d.Parent.Name end
+						end
+					end
+				end
+			end)
+			if not best then xReport("far-collect", "SKIP (nothing 150+ away)") return end
+			local rf = findRemote("Collect", "RemoteFunction")
+			if not rf then xReport("far-collect", "NOREMOTE") return end
+			local ok, res = pcall(function() return rf:InvokeServer(bestGroup, best.Name) end)
+			local flag = (res and "  <-- SERVER SKIPS DISTANCE CHECK") or ""
+			xReport("far-collect", "dist=" .. math.floor(bestD) .. " ok=" .. tostring(ok) .. " res=" .. tostring(res) .. flag)
+			pcall(function() status:Set("Status: Exploits - far collect res=" .. tostring(res)) end)
+		end)
+	end,
+})
+
+ExploitsTab:AddButton({
+	Title    = "Probe: Fake Collect",
+	Subtitle = "Collects a made-up item name (thin-air test)",
+	Icon     = "play",
+	Text     = "Run",
+	Callback = function()
+		task.spawn(function()
+			local rf = findRemote("Collect", "RemoteFunction")
+			if not rf then xReport("fake-collect", "NOREMOTE") return end
+			for _, g in ipairs({ "Halloween2026Pumpkins", "Halloween2026", "EasterEgg2026" }) do
+				local ok, res = pcall(function() return rf:InvokeServer(g, "FAKE_ITEM_XYZ_123") end)
+				local flag = (res and "  <-- SERVER GRANTS THIN AIR") or ""
+				xReport("fake-collect", g .. " ok=" .. tostring(ok) .. " res=" .. tostring(res) .. flag)
+				task.wait(0.5)
+			end
+		end)
+	end,
+})
+
+ExploitsTab:AddButton({
+	Title    = "Probe: Kit Return",
+	Subtitle = "Opens one kit, reports return shape",
+	Icon     = "play",
+	Text     = "Run",
+	Callback = function()
+		task.spawn(function()
+			local rf = findRemote("Consume", "RemoteFunction")
+			if not rf then xReport("kit-consume", "NOREMOTE") return end
+			local ok, res = pcall(function() return rf:InvokeServer("DecorationKit") end)
+			xReport("kit-consume", "ok=" .. tostring(ok) .. " type=" .. typeof(res) .. " val=" .. tostring(res):sub(1, 200))
+		end)
+	end,
+})
+
+ExploitsTab:AddButton({
+	Title    = "Probe: Fake Shop Buy",
+	Subtitle = "Buys a fake id (validation style, safe)",
+	Icon     = "play",
+	Text     = "Run",
+	Callback = function()
+		task.spawn(function()
+			local rf = findRemote("PurchaseShopItem", "RemoteFunction")
+			if not rf then xReport("fake-shop", "NOREMOTE") return end
+			local ok, res = pcall(function() return rf:InvokeServer("FAKE_ITEM_XYZ_123") end)
+			xReport("fake-shop", "ok=" .. tostring(ok) .. " res=" .. tostring(res):sub(1, 300))
+		end)
+	end,
+})
+
+ExploitsTab:AddButton({
+	Title    = "Probe: Order-ID Fuzz",
+	Subtitle = "Fake accept/complete (response leaks validation)",
+	Icon     = "play",
+	Text     = "Run",
+	Callback = function()
+		task.spawn(function()
+			local rf = findRemote("NPCHandler", "RemoteEvent")
+			if not rf then xReport("order-fuzz", "NOREMOTE") return end
+			local ok1 = pcall(function() rf:FireServer({ Action = "AcceptOrder", OrderId = "0" }) end)
+			xReport("order-fuzz", "AcceptOrder('0') ok=" .. tostring(ok1))
+			task.wait(0.5)
+			local ok2 = pcall(function() rf:FireServer({ Action = "AcceptOrder", OrderId = 123456789 }) end)
+			xReport("order-fuzz", "AcceptOrder(123456789) ok=" .. tostring(ok2))
+			task.wait(0.5)
+			local ok3 = pcall(function()
+				rf:FireServer({ Action = "CompleteOrder", OrderId = "0",
+					Specs = { Car = "Sultan", Color = "Red", Rims = "Default", RimColor = "Black", Springs = "Default" } })
+			end)
+			xReport("order-fuzz", "CompleteOrder('0', cheap car) ok=" .. tostring(ok3) .. " (check cash)")
+			pcall(function() status:Set("Status: Exploits - order fuzz fired, check cash") end)
+		end)
+	end,
+})
+
+ExploitsTab:AddButton({
+	Title    = "Probe: Far Delivery",
+	Subtitle = "Interacts a distant delivery item, no driving",
+	Icon     = "play",
+	Text     = "Run",
+	Callback = function()
+		task.spawn(function()
+			local _, _, root = parts()
+			local games = workspace:FindFirstChild("ActionTasksGames")
+			if not root then notify("XHUNT: no character") return end
+			if not games then xReport("far-delivery", "SKIP (no ActionTasksGames right now)") return end
+			local me = root.Position
+			local item, gname, dist = nil, nil, 0
+			pcall(function()
+				for _, d in ipairs(games:GetDescendants()) do
+					local okB = false
+					pcall(function() okB = d:IsA("BasePart") end)
+					if okB and d.Parent and d.Parent.Name:find("DeliveryGame") then
+						local dd = (d.Position - me).Magnitude
+						if dd > dist then item, gname, dist = d, d.Parent.Name, dd end
+					end
+				end
+			end)
+			if not item then xReport("far-delivery", "SKIP (no DeliveryGame items right now)") return end
+			local ar = findRemote("ActionGameDataReplication", "RemoteEvent")
+			if not ar then xReport("far-delivery", "NOREMOTE") return end
+			pcall(function() ar:FireServer("TryInteractWithItem", { GameName = gname, ItemId = item.Name }) end)
+			xReport("far-delivery", "fired dist=" .. math.floor(dist) .. " (check delivery UI / cash)")
+			task.wait(0.5)
+			pcall(function() ar:FireServer("TryInteractWithItem", { GameName = gname, ItemId = "FAKE_ITEM_XYZ" }) end)
+			xReport("far-delivery", "fake ItemId fired")
+		end)
+	end,
+})
+
+ExploitsTab:AddButton({
+	Title    = "Probe: Owned Cars",
+	Subtitle = "Read-only car list (id format recon)",
+	Icon     = "play",
+	Text     = "Run",
+	Callback = function()
+		task.spawn(function()
+			local rf = findRemote("GetOwnedCars", "RemoteFunction")
+			if not rf then xReport("owned-cars", "NOREMOTE") return end
+			local ok, owned = pcall(function() return rf:InvokeServer() end)
+			xReport("owned-cars", "ok=" .. tostring(ok) .. " type=" .. typeof(owned))
+			if ok and typeof(owned) == "table" then
+				local n = 0
+				for _, c in pairs(owned) do
+					n += 1
+					if n <= 5 then
+						local s = tostring(c):sub(1, 80)
+						pcall(function() s = "Name=" .. tostring(c.Name) .. " Id=" .. tostring(c.Id) end)
+						xReport("owned-cars", s)
+					end
+				end
+				xReport("owned-cars", "total=" .. n)
+			end
+		end)
+	end,
+})
+
+ExploitsTab:AddButton({
+	Title    = "Probe: Tycoon Recon",
+	Subtitle = "Owners + cash prompts (read-only)",
+	Icon     = "play",
+	Text     = "Run",
+	Callback = function()
+		task.spawn(function()
+			local ty = workspace:FindFirstChild("Tycoons")
+			if not ty then xReport("tycoon-recon", "SKIP (no Tycoons)") return end
+			for _, t in ipairs(ty:GetChildren()) do
+				local o = "?"
+				pcall(function() o = tostring(t:FindFirstChild("Owner") and t.Owner.Value) end)
+				local mine = (o == LP.Name) and " (MINE)" or ""
+				xReport("tycoon-recon", "tycoon=" .. t.Name .. " owner=" .. o .. mine)
+			end
+			local n = 0
+			for _, d in ipairs(ty:GetDescendants()) do
+				local okP = false
+				pcall(function() okP = d:IsA("ProximityPrompt") end)
+				if okP then
+					n += 1
+					if n <= 15 then
+						local act = "?"
+						pcall(function() act = tostring(d.ActionText) .. "/" .. tostring(d.ObjectText) end)
+						local obj = "?"
+						pcall(function() obj = tostring(d.Parent and d.Parent:GetFullName()) end)
+						xReport("tycoon-recon", "prompt: " .. act .. " @ " .. obj)
+					end
+				end
+			end
+			xReport("tycoon-recon", "total prompts=" .. n)
+		end)
+	end,
+})
+
+ExploitsTab:AddButton({
+	Title    = "Probe: UGC Recon",
+	Subtitle = "Lists UGC/event-claim remotes (read-only)",
+	Icon     = "play",
+	Text     = "Run",
+	Callback = function()
+		task.spawn(function()
+			pcall(function()
+				for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+					local okN, nm = pcall(function() return d.Name end)
+					if okN and nm and (nm:find("UGC") or nm:find("TrickOrTreat") or nm:find("Maze")) then
+						local cls = "?"
+						pcall(function() cls = d.ClassName end)
+						xReport("ugc-recon", cls .. " " .. d:GetFullName())
+					end
+				end
+			end)
+			xReport("ugc-recon", "done")
+		end)
+	end,
+})
+
+ExploitsTab:AddSeparator()
+
+ExploitsTab:AddButton({
+	Title    = "OPT-IN: Buy Locked Ferrari47",
+	Subtitle = "SPENDS 3500 event currency if vulnerable",
+	Icon     = "shopping-cart",
+	Text     = "Buy",
+	Risky    = true,
+	Callback = function()
+		task.spawn(function()
+			local rf = findRemote("PurchaseShopItem", "RemoteFunction")
+			if not rf then xReport("opt-ferrari", "NOREMOTE") return end
+			local ok, res = pcall(function() return rf:InvokeServer("Ferrari47") end)
+			xReport("opt-ferrari", "ok=" .. tostring(ok) .. " res=" .. tostring(res):sub(1, 200))
+		end)
+	end,
+})
+
+ExploitsTab:AddButton({
+	Title    = "OPT-IN: Complete Other Order",
+	Subtitle = "Uses Exploit OrderId + Auto Sell car name",
+	Icon     = "dollar-sign",
+	Text     = "Fire",
+	Risky    = true,
+	Callback = function()
+		if ExploitOrderId == "" then notify("XHUNT: enter an OrderId first") return end
+		if SellCarName == "" then notify("XHUNT: enter the Auto Sell car name first") return end
+		task.spawn(function()
+			local rf = findRemote("NPCHandler", "RemoteEvent")
+			if not rf then xReport("opt-order", "NOREMOTE") return end
+			pcall(function() rf:FireServer({ Action = "AcceptOrder", OrderId = ExploitOrderId }) end)
+			task.wait(1)
+			pcall(function()
+				rf:FireServer({ Action = "CompleteOrder", OrderId = ExploitOrderId,
+					Specs = { Car = SellCarName, Color = "Red", Rims = "Default", RimColor = "Black", Springs = "Default" } })
+			end)
+			xReport("opt-order", "fired for " .. tostring(ExploitOrderId) .. " (check cash)")
+		end)
+	end,
+})
+
+-- ===== 9. Settings (no key system) =====
 local SettingsTab = Window:AddTab("Settings", "settings")
 
 local themeNames = {}
@@ -2139,7 +2459,7 @@ SettingsTab:AddButton({
 	end,
 })
 
--- ===== 9. Stats panel + quick bar =====
+-- ===== 10. Stats panel + quick bar =====
 Panel = VantixUI:CreateNewWindow({
 	Title       = "Live Stats (White)",
 	Name        = "VenasStats",
