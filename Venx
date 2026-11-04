@@ -403,7 +403,7 @@ local cruiseBox = MainTab:AddTextBox({
 
 farmToggle = MainTab:AddToggle({
 	Title = "Auto Farm (Cruise)",
-	Subtitle = "Ground driving, no sky road, no teleports",
+	Subtitle = "Runway -2750,605,4890 to 2220, holds W, never touches the car",
 	Icon = "navigation",
 	Default = false,
 	Callback = function(state)
@@ -424,43 +424,70 @@ farmToggle = MainTab:AddToggle({
 		end
 		Fresh._cruiseRunning = true
 		task.spawn(function()
-			local warned = false
-			local laps = 0
+			-- runway cruise: start (-2750,605,4890) -> end (-2750,605,2220), holds W, never pushes the car
+			local START_POS = Vector3.new(-2750, 605, 4890)
+			local END_POS = Vector3.new(-2750, 605, 2220)
+			local VIM = nil
+			pcall(function() VIM = game:GetService("VirtualInputManager") end)
+			local function cruisePlace()
+				-- snap back WITHOUT touching velocity: PivotTo preserves momentum
+				local seat = freshSeat()
+				if seat then
+					local car = freshCar(seat)
+					if car then
+						pcall(function()
+							car:PivotTo(CFrame.lookAt(START_POS, Vector3.new(END_POS.X, START_POS.Y, END_POS.Z)))
+						end)
+					end
+				end
+			end
+			local wDown = false
+			local function cruiseHoldW(down)
+				if not VIM then return end
+				if down == wDown then return end
+				if down then
+					local focused = false
+					pcall(function() focused = UIS:GetFocusedTextBox() ~= nil end)
+					if focused then return end
+				end
+				wDown = down
+				pcall(function() VIM:SendKeyEvent(down, Enum.KeyCode.W, false, game) end)
+			end
+			local warned, placed, laps = false, false, 0
 			while Fresh.Cruise and not FreshOff do
 				local seat = freshSeat()
 				if not seat or not seat:IsA("VehicleSeat") then
+					cruiseHoldW(false)
+					placed = false
 					if not warned then
 						warned = true
-						freshNotify("Cruise: sit in any car and it drives itself")
+						freshNotify("Cruise: sit in any car - W is held, it drives itself")
 						freshStatus("Status: Cruise - waiting for you to sit in a car")
 					end
 					task.wait(1)
 				else
 					warned = false
+					if not placed then placed = true cruisePlace() task.wait(0.5) end
+					cruiseHoldW(true)
+					pcall(function() seat.MaxSpeed = CruiseSpeed end)
 					local car = freshCar(seat)
 					local okP, pivot = pcall(function() return car:GetPivot() end)
-					if not okP or not pivot then
-						task.wait(1)
-					else
-						-- square loop 260 studs around where you started driving
-						local c = pivot.Position
-						local R = 260
-						local corners = {
-							c + Vector3.new(R, 0, 0),
-							c + Vector3.new(R, 0, R),
-							c + Vector3.new(0, 0, R),
-							c,
-						}
-						for i, wp in ipairs(corners) do
-							if not Fresh.Cruise or FreshOff then break end
-							freshStatus(string.format("Status: Cruise - leg %d/4, lap %d @ %d", i, laps + 1, CruiseSpeed))
-							freshSteerTo(Vector3.new(wp.X, c.Y, wp.Z), CruiseSpeed, 30, "Cruise", 30)
+					if okP and pivot then
+						local pos = pivot.Position
+						if pos.Z <= (END_POS.Z + 30) then
+							cruisePlace()
+							laps = laps + 1
+							Fresh.CruiseLaps = laps
+							freshLog("Cruise: lap " .. tostring(laps) .. " done")
 						end
-						laps = laps + 1						Fresh.CruiseLaps = laps
-						freshLog("Cruise: lap " .. tostring(laps) .. " done")
+						local total = (START_POS.Z - pos.Z) / (START_POS.Z - END_POS.Z)
+						total = math.clamp(total, 0, 1)
+						freshStatus(string.format("Status: Cruise - lap %d, %d%% @ %d", laps + 1, math.floor(total * 100), CruiseSpeed))
 					end
+					task.wait(0.5)
 				end
 			end
+			cruiseHoldW(false)
 			local seat = freshSeat()
 			if seat and seat:IsA("VehicleSeat") then
 				pcall(function()
@@ -804,7 +831,7 @@ MoneyTab:AddToggle({
 
 MoneyTab:AddToggle({
 	Title = "Auto Upgrade Dealership",
-	Subtitle = "Teleports pad to pad via Purchases, buys what is affordable",
+	Subtitle = "Fast-sweeps Purchases pads, no waiting",
 	Icon = "arrow-up-circle",
 	Default = false,
 	Callback = function(state)
@@ -885,26 +912,15 @@ MoneyTab:AddToggle({
 							end)
 						end)
 					end
-					local pad = pads[1]
-					local okC, cf = pcall(function() return pad.CFrame end)
-					if okC and cf then freshGoto(cf + Vector3.new(0, 4, 0)) end
-					freshPromptBurst(pad.Position, 16)
-					freshTouch(pad)
-					freshStatus("Status: Upgrade - buying " .. tostring(seenP[pad] or pad.Name))
-					local t0 = os.clock()
-					local lastFire = 0
-					while Fresh.Upgrade and not FreshOff and (os.clock() - t0) < 15 do
-						local gone = false
-						pcall(function()
-							if (not pad.Parent) or (not pad:IsDescendantOf(workspace)) then gone = true end
-						end)
-						if gone then break end
-						if os.clock() - lastFire > 3 then
-							lastFire = os.clock()
-							pcall(function() freshPromptBurst(pad.Position, 16) end)
-							freshTouch(pad)
-						end
-						task.wait(1)
+					-- fast sweep: touch each pad and move on, no gone-wait
+					for _, pad in ipairs(pads) do
+						if not Fresh.Upgrade or FreshOff then break end
+						local okC, cf = pcall(function() return pad.CFrame end)
+						if okC and cf then freshGoto(cf + Vector3.new(0, 4, 0)) end
+						pcall(function() freshPromptBurst(pad.Position, 16) end)
+						freshTouch(pad)
+						freshStatus("Status: Upgrade - buying " .. tostring(seenP[pad] or pad.Name))
+						task.wait(0.7)
 					end
 					task.wait(1)
 				end)
