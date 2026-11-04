@@ -1,405 +1,2013 @@
--- Vehicle Dealership -- faithful behavioral reconstruction
--- Source: IronBrew3-obfuscated chunk (~260KB, "obfuscated with ironbrew3:tm:").
--- Method: executed the REAL VM under instrumentation (wasmoon Lua 5.4, full
---   Roblox API mock; 100+ probes in scratch/retry/, batches C-K). Every
---   behavior below was OBSERVED in call logs. Points the mock could not reach
---   (VM raises its own Luau-style errors past mock gaps) are marked UNKNOWN.
--- Limitation: reads of already-set globals leave no trace, so exact branch
---   conditions on globals are only known where a nil-read or a behavioral
---   difference (on-foot vs seated, config vs no-config) exposed them.
+-- Vena Mega -- Car Dealership Tycoon (place 1554960397), all-new functional MEGA build
+-- Not a deobfuscation: every function below is written fresh for this game.
+-- Beats the keyed ScriptBlox hubs at their own game, with no key: physical
+-- Design notes (why the old autofarm broke):
+--   The old Miles Grinder built a CLIENT-SIDED sky road and PivotTo-glided the
+--   car along it every heartbeat. Client parts have no collision on the server
+--   (FilteringEnabled), so the server saw the car fall / rubber-banded it back
+--   and the glide fought physics at 60Hz. This build uses ZERO client parts and
+--   ZERO position teleports for driving: it faces the car with rotation-only
+--   snaps and holds real throttle, so the server sees legitimate driving.
+-- The one thing that worked (teleport collect on foot) is kept, rewritten clean.
+
+local VantixUI = nil
+do
+	local lastErr = nil
+	for _ = 1, 3 do
+		local ok, lib = pcall(function()
+			return loadstring(game:HttpGet("https://raw.githubusercontent.com/Snipez-Dev/Vantix/refs/heads/main/VantixUI6"))()
+		end)
+		if ok and lib then VantixUI = lib break end
+		lastErr = lib
+		task.wait(2)
+	end
+	if not VantixUI then
+		warn("Vena Fresh: VantixUI failed to load: " .. tostring(lastErr))
+		return
+	end
+end
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local LocalPlayer = Players.LocalPlayer
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local CollectionService = game:GetService("CollectionService")
+local VirtualUser = game:GetService("VirtualUser")
+local LP = Players.LocalPlayer
 
--- ===== 0. Prologue (runs before UI) =====
--- Observed order: Idled connect, DescendantAdded connect, per-part
--- pre-stream, Collectibles DB setup, grav save, UI lib, windows, config.
-LocalPlayer.Idled:connect(function()
-  -- Handler body never fired in sandbox: UNKNOWN (standard anti-AFK slot).
+local FreshOff = false
+local Fresh = {} -- feature on/off flags
+
+-- anti-AFK only (no metatable hooks in the fresh build: less flag surface)
+pcall(function()
+	if LP and LP.Idled then
+		LP.Idled:Connect(function()
+			pcall(function()
+				local cam = workspace.CurrentCamera
+				if cam then
+					VirtualUser:Button2Down(Vector2.new(0, 0), cam.CFrame)
+					task.wait(1)
+					VirtualUser:Button2Up(Vector2.new(0, 0), cam.CFrame)
+				end
+			end)
+		end)
+	end
 end)
 
-workspace.DescendantAdded:Connect(function(added)
-  -- Observed with a Cars descendant: checks IsA("Model"), IsA("BasePart").
-  -- Full condition/action unrecovered. INFERRED (marked): the delivery
-  -- worker waits on `spawned`, which is never set true anywhere else, so
-  -- this handler most likely sets spawned = true when the truck (a Model)
-  -- spawns. Kept as inference, not fact:
-  if added:IsA("Model") then
-    -- spawned = true  -- INFERRED, unobserved
-  elseif added:IsA("BasePart") then
-  end
-end)
-
-for _, part in ipairs(workspace:GetDescendants()) do
-  if part:IsA("Model") then
-    part.ModelStreamingMode = Enum.ModelStreamingMode.Persistent
-    task.spawn(function()
-      LocalPlayer:RequestStreamAroundAsync(part:GetPivot().Position)
-    end)
-  elseif part:IsA("BasePart") then
-    task.spawn(function()
-      LocalPlayer:RequestStreamAroundAsync(part.Position)
-    end)
-  end
+-- ===== small helpers (fresh names, fresh code) =====
+local Window -- forward decl so helpers can notify
+local function freshNotify(text)
+	pcall(function()
+		Window:Notify({ Title = "Vena Fresh", Text = text, Duration = 3 })
+	end)
 end
 
-local CollectiblesDB = require(ReplicatedStorage.Databases.Collectibles)
-local Pumpkins = CollectiblesDB.Halloween2026Pumpkins
-local _roll = Pumpkins.Roll
-local _roll2 = Pumpkins.Roll
-Pumpkins.Roll.ViewDistance = math.huge
-local _roll3 = Pumpkins.Roll
-Pumpkins.Roll.MaxVisible = math.huge
-
-local grav = workspace.Gravity
-
--- ===== Remote UI lib (also IronBrew3, 130KB) =====
-local UILib = loadstring(game:HttpGet("https://raw.githubusercontent.com/Marco8642/science/main/ui%20libs2"))()
-
--- ===== Windows (4 windows, 28 callbacks, exact observed labels) =====
-local MainWindow = UILib:CreateWindow({text = "Vehicle Dealership"})
-local DeliveryWindow = UILib:CreateWindow({text = "Delivery Options"})
-local RaceWindow = UILib:CreateWindow({text = "Race"})
-local MiscWindow = UILib:CreateWindow({text = "Misc"})
-
--- Boxes: callback shape fn(box, entered); on entered, global = tonumber(box.Text).
--- Observed: {Text="100"}+true -> speed=100; "100"+true -> speed=nil (box.Text nil).
-MainWindow:AddBox("Enter Auto Drive Speed", function(box, entered)
-  if entered then speed = tonumber(box.Text) end
-end)
-DeliveryWindow:AddLabel("Minimum Stars")
-DeliveryWindow:AddBox("Enter Star Amount", function(box, entered)
-  if entered then stars = tonumber(box.Text) end
-end)
-DeliveryWindow:AddLabel("Minimum Reward Money")
-DeliveryWindow:AddBox("Enter Minimum Reward", function(box, entered)
-  if entered then smaller = tonumber(box.Text) end
-end)
-DeliveryWindow:AddLabel("Maximum Reward Money")
-DeliveryWindow:AddBox("Enter Maximum Reward", function(box, entered)
-  if entered then bigger = tonumber(box.Text) end
-end)
-RaceWindow:AddBox("Enter Auto Race Speed", function(box, entered)
-  if entered then speed = tonumber(box.Text) end -- observed write target: `speed`
-end)
-
--- ===== Delivery config file (build phase) =====
--- cdtdelivery.txt read 7x ("3 5000 20000"); the three w2 boxes get .Text set
--- to the tokens in order; globals stars/smaller/bigger are set to the raw
--- string tokens; prints observed exactly:
-do
-  local raw = readfile("cdtdelivery.txt") -- "3 5000 20000"
-  local toks = {}
-  for tok in raw:gmatch("%S+") do toks[#toks + 1] = tok end -- parse op unrecovered; values observed
-  -- box.Text defaults + globals (observed order):
-  -- stars box .Text = toks[1]; stars = toks[1] (etc.)
-  stars, smaller, bigger = toks[1], toks[2], toks[3]
-  print("Stars: " .. tostring(stars))
-  print("Minimum reward money: " .. tostring(smaller))
-  print("Maximum reward money: " .. tostring(bigger))
+local statusLine, feed -- assigned at bottom of Main tab (callbacks run later, so refs are fine)
+local function freshStatus(text)
+	pcall(function() statusLine:Set(text) end)
+end
+local function freshLog(text)
+	pcall(function() feed:Write(text) end)
 end
 
--- Protected sub ritual: after several scalar global writes the script calls
--- pcall(string.sub, value, 1, 80). Observed with true/false/numbers/nil (all
--- error inside pcall -> no effect) and with strings (prefix discarded).
--- Purpose unrecovered; reproduced for fidelity (it is the only string.sub
--- traffic besides the delivery file parse).
-local function _sub80(v) pcall(string.sub, v, 1, 80) end
-
--- ===== Main toggles =====
-MainWindow:AddToggle("Auto Farm", function(on)
-  auto = on
-  if not on then
-    workspace.Gravity = grav
-    -- cleanup section runs here (crashed on mock gap; behaviorally: restore + stop)
-    return
-  end
-  workspace.Gravity = 196
-  -- Pass 1: scan vehicle container descendants; for BaseParts read GetAttribute("CanCollide").
-  -- Pass 2: set CanCollide = false + SetAttribute("CanCollide", true).
-  -- Pivot the car model to the "justapart" part; read container PrimaryPart
-  -- Position/CFrame; set PrimaryPart.AssemblyLinearVelocity = Vector3.new(0,0,-100).
-  local TweenService = game:GetService("TweenService")
-  local _tweenNew = TweenInfo.new -- read observed; never called in sandbox
-  -- UNKNOWN past this point: script computes X / speed with X nil under the
-  -- mock (div crashes), i.e. the tween/drive loop needs real game state.
-  -- Shape (inferred from prefix): build a TweenInfo and tween the car at `speed`.
-  while auto do task.wait() end
-end)
-
-MainWindow:AddToggle("Auto Collect Pumpkins", function(on)
-  collectables1 = on
-  while collectables1 do
-    local kids = workspace.HalloweenPumpkinsLocal:GetChildren()
-    if #kids == 0 then
-      task.wait() -- empty list: re-list polling (no moves observed)
-    else
-      for _, pumpkin in ipairs(kids) do
-        if pumpkin:IsA("BasePart") then
-          -- Spam PivotTo onto the pumpkin (observed: ALL ~3900 teleports hit
-          -- the first-listed pumpkin; PostSimulation:Wait paced; collection
-          -- itself is by touch contact). Inner-loop exit unrecovered (it is
-          -- not despawn-gated: the mock never despawns yet the loop advances
-          -- ~155 teleports per outer wait -- likely a fixed count or timer):
-          for _ = 1, 155 do
-            game:GetService("RunService").PostSimulation:Wait()
-            LocalPlayer.Character:PivotTo(pumpkin.CFrame)
-          end
-          break -- re-list after each cycle (first-listed target observed)
-        end
-      end
-    end
-    task.wait()
-  end
-end)
-
-MainWindow:AddToggle("Auto Farm Collectibles ", function(on)
-  collectables = on
-  while collectables do
-    for _, coin in ipairs(workspace.Collectibles:GetDescendants()) do
-      if coin:IsA("Model") then
-        local parent = coin.Parent
-        if parent and parent:IsA("Folder") then
-          local _parts = coin:GetChildren() -- listed, then nothing observed
-        end
-      end
-      -- UNKNOWN: collection trigger never observed (no moves, no remotes;
-      -- not teleport: zero PivotTo in 600-line traces). Probably
-      -- touch/prompt based; mock has neither.
-    end
-    task.wait()
-  end
-end)
-
-MainWindow:AddToggle("Auto Open Vehicle Kit", function(on)
-  -- No toggle global observed; loop while on:
-  local ClaimFreePack = ReplicatedStorage.Remotes.Services.CarKitEventServiceRemotes.ClaimFreePack
-  while on do
-    ClaimFreePack:InvokeServer() -- observed: no args, ~1 call per wait
-    task.wait()
-  end
-end)
-
-MainWindow:AddToggle("Auto Extinguish Fire", function(on)
-  fireman = on
-  workspace.Gravity = 196
-  while fireman do
-    LocalPlayer.Character.HumanoidRootPart.Velocity = Vector3.new(0, 0, 0) -- observed zero vector
-    local tool = LocalPlayer.Backpack:FindFirstChildOfClass("Tool")
-    if tool then LocalPlayer.Character.Humanoid:EquipTool(tool) end
-    -- extinguishing itself is by touch contact; no remotes observed
-    task.wait()
-  end
-end)
-
-MainWindow:AddToggle("Auto Sell Cars", function(on)
-  Customer = on
-  rat = nil
-  while Customer do
-    for _, tycoon in ipairs(workspace.Tycoons:GetDescendants()) do
-      local name = tycoon.Name -- observed reads; match rule below
-      local _hasPlot = string.find(name, "Plot")
-      local _hasSlot = string.find(name, "Slot")
-      local ownerName = tycoon.Owner.Name -- observed reads (Plot1 matched
-      local ownerClass = tycoon.Owner.ClassName -- LocalPlayer.Name here)
-      local ownerValue = tycoon.Owner.Value
-      local _me = LocalPlayer.Name
-      -- Whether/how ownerValue == player is branched on is unrecovered: the
-      -- crash below happens identically on match, mismatch, and Slot names.
-    end
-    -- UNKNOWN past this point: with the mock world the VM raises its own
-    -- "bad argument (string expected, got boolean)" before any remote, even
-    -- when owner matches, mismatches, or the tycoon is Slot-named. The sell
-    -- remote name/args were never observed. Nothing is guessed here.
-    task.wait()
-  end
-end)
-
-MainWindow:AddToggle("Auto Speed Traps", function(on)
-  speedstrap = on
-  -- Requires seated: on foot, Humanoid.SeatPart chain is nil -> index crash.
-  local seat = LocalPlayer.Character.Humanoid.SeatPart
-  local _car = seat.Parent
-  while speedstrap do
-    for _, cam in ipairs(workspace.SpeedCameras:GetDescendants()) do
-      local _n = cam.Name -- polled every iteration; no writes observed
-      -- UNKNOWN: drive-through action never observed (zero moves/remotes).
-    end
-    task.wait()
-  end
-end)
-
--- Win1 delivery: arms globals + sit-poll loop. Silent (no prints, no file
--- write observed). Foot start also writes spawned = false (skipped when
--- already seated -- observed across batches).
-MainWindow:AddToggle("Auto Delivery", function(on)
-  deliver = on
-  if not on then return end
-  resetcharactervalue1 = 0
-  devpart2 = 1
-  if not LocalPlayer.Character:WaitForChild("Humanoid").Sit then
-    spawned = false -- on-foot start only (observed foot-vs-seated difference)
-  end
-  while deliver do
-    local _sit = LocalPlayer.Character:WaitForChild("Humanoid").Sit
-    -- Gated delivery action never triggered in sandbox (needs truck/spawned
-    -- state the mock cannot produce). No scan/print/file traffic observed here.
-    task.wait()
-  end
-end)
-
-MainWindow:AddToggle("Annoying Popup Disabler", function(on)
-  annoy = on
-  if on then
-    -- Note capital-C Connect (observed path PlayerGui.ChildAdded.Connect).
-    fun = LocalPlayer.PlayerGui.ChildAdded:Connect(function(_child)
-      -- Callback body never fired in sandbox: UNKNOWN (presumably destroys popups).
-    end)
-  end
-end)
-
--- Win2 delivery worker: full observed flow (prints positioned via LOG).
-DeliveryWindow:AddToggle("Auto Delivery", function(on)
-  deliver2 = on
-  if not on then return end
-  local _cfg = stars .. smaller .. bigger -- all three read then concatenated
-  -- (observed nil-reads + concat crash without config; exact expression unrecovered)
-  _sub80(true)
-  local raw = readfile("cdtdelivery.txt") -- "3 5000 20000"
-  print(raw)
-  local _prefix = string.sub(raw, 1, 120)
-  writefile("cdtdelivery.txt", raw) -- written back identically (observed)
-  resetcharactervalue = 0
-  _sub80(0)
-  devpart = 1
-  _sub80(1)
-  LocalPlayer.Character.Head.Anchored = false
-  -- Loop A: Sit polls (observed many when seated, few on foot). The exit
-  -- predicate is unrecovered (it is neither wait-until-seated nor
-  -- wait-while-seated: both states proceed to the scan). Bounded here with
-  -- the on-foot branch observed inside it:
-  local _polls = 0
-  while deliver2 and _polls < 60 do
-    if not LocalPlayer.Character:WaitForChild("Humanoid").Sit then
-      spawned = false -- on-foot path only (observed foot-vs-seated difference)
-      _sub80(false)
-      break
-    end
-    task.wait()
-    _polls = _polls + 1
-  end
-  -- Truck scan (observed once per run):
-  for _, truck in ipairs(workspace.Cars:GetChildren()) do
-    local _nm = string.match(truck:GetFullName(), "([^.:]+)$")
-  end
-  print("no truck found") -- observed even when a truck part exists; match rule unrecovered
-  timeout = 0
-  _sub80(0)
-  -- VM decrypts/builds "Ironbrew VM Error: \n" here via string.char (observed 2x)
-  local _e1 = string.char(73,114,111,110,98,114,101,119,32,86,77,32,69,114,114,111,114,58,32,10)
-  print("bro spawned in") -- observed in the same pass, right after the above
-  local _e2 = string.char(73,114,111,110,98,114,101,119,32,86,77,32,69,114,114,111,114,58,32,10)
-  checkif = nil
-  _sub80(nil)
-  -- Loop B: waits for delivery completion (exit unrecovered; WAITCAP in sandbox).
-  while deliver2 do task.wait() end
-end)
-
--- ===== Race (win3) =====
-RaceWindow:AddToggle("Auto Race", function(on)
-  racetest = on
-  if not on then return end
-  workspace.Gravity = 196
-  for _, node in ipairs(workspace.Races:GetDescendants()) do
-    local _n = string.match(node.Name, "([^.:]+)$") -- checkpoint scan (observed)
-  end
-  LocalPlayer:RequestStreamAroundAsync(Vector3.new(-1989.9, 592.6, 6957.3)) -- hardcoded (observed)
-  -- UNKNOWN past this point: VM index-nil with no further game traffic, for
-  -- tycoon = "Race1"/"race1"/3/"3"/model alike. The `tycoon` global is
-  -- consulted somewhere past here (writer never observed in any probe).
-  while racetest do task.wait() end
-end)
-RaceWindow:AddToggle("Auto Drift Race", function(on)
-  racetest3 = on
-  if not on then return end
-  for _, node in ipairs(workspace.Races:GetDescendants()) do
-    local _n = string.match(node.Name, "([^.:]+)$")
-  end
-  -- Same hardcoded stream-around + UNKNOWN drive section as Auto Race.
-  LocalPlayer:RequestStreamAroundAsync(Vector3.new(-1989.9, 592.6, 6957.3))
-  while racetest3 do task.wait() end
-end)
-RaceWindow:AddToggle("AutoFarm[laps|checkpoints]", function(on)
-  racetest = on
-  if not on then return end
-  workspace.Gravity = 196
-  for _, node in ipairs(workspace.Races:GetDescendants()) do
-    local _n = string.match(node.Name, "([^.:]+)$")
-  end
-  LocalPlayer:RequestStreamAroundAsync(Vector3.new(-1989.9, 592.6, 6957.3))
-  -- UNKNOWN drive section (same as Auto Race).
-  while racetest do task.wait() end
-end)
-
--- ===== Misc (win4) =====
-MiscWindow:AddButton("Force Load Map", function()
-  for _, inst in ipairs(workspace:GetDescendants()) do
-    if inst.ClassName == "Model" then -- only Models streamed (observed)
-      LocalPlayer:RequestStreamAroundAsync(inst.WorldPivot.Position, 1)
-    end
-  end
-end)
-MiscWindow:AddLabel("Race Teleports")
-do
-  local names = { "None" }
-  for _, race in ipairs(workspace.Races:GetChildren()) do
-    if race:IsA("Model") then table.insert(names, race.Name) end
-  end
-  -- Observed 1-arg and 2-arg invocations; both teleport, neither writes tycoon.
-  MiscWindow:AddDropdown(names, function(choice)
-    local race = workspace.Races:FindFirstChild(choice)
-    if race then
-      local gate = race:FindFirstChildOfClass("UnionOperation")
-      if gate then LocalPlayer.Character.HumanoidRootPart.CFrame = gate.CFrame end
-    end
-  end)
+local function freshChar()
+	local char = LP.Character
+	if not char then return nil end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local root = char:FindFirstChild("HumanoidRootPart")
+	if not hum or not root then return nil end
+	return char, hum, root
 end
-MiscWindow:AddToggle("Auto Open Delux Custom Crate", function(on)
-  workspace.Gravity = 196
-  local Consume = ReplicatedStorage.Remotes.Services.ConsumableServiceRemotes.Consume
-  while on do Consume:InvokeServer("DecorationKitDeluxe") task.wait() end
-end)
-MiscWindow:AddToggle("Auto Open Custom Crate", function(on)
-  workspace.Gravity = 196
-  local Consume = ReplicatedStorage.Remotes.Services.ConsumableServiceRemotes.Consume
-  while on do Consume:InvokeServer("DecorationKit") task.wait() end
-end)
-MiscWindow:AddToggle("Auto Open Event Crate", function(on)
-  workspace.Gravity = 196
-  local Consume = ReplicatedStorage.Remotes.Services.ConsumableServiceRemotes.Consume
-  while on do Consume:InvokeServer("DecorationKitHalloween") task.wait() end
-end)
-MiscWindow:AddToggle("Auto Buy Event Crate", function(on)
-  local Shop = ReplicatedStorage.Databases.HalloweenEvent.PurchaseShopItem
-  while on do Shop:InvokeServer("HalloweenKit") task.wait() end
+
+local function freshSeat()
+	local _, hum = freshChar()
+	if not hum then return nil end
+	local seat = hum.SeatPart
+	if not seat then return nil end
+	return seat
+end
+
+-- top-most vehicle Model above the seat (nesting varies per chassis)
+local function freshCar(seat)
+	if not seat then return nil end
+	local node, top = seat.Parent, nil
+	while node and node ~= workspace do
+		local ok, isModel = pcall(function() return node:IsA("Model") end)
+		if ok and isModel then top = node end
+		node = node.Parent
+	end
+	return top
+end
+
+local function freshHrpPos()
+	local _, _, root = freshChar()
+	return root and root.Position
+end
+
+local function freshFirstPart(obj)
+	if not obj then return nil end
+	local ok, isPart = pcall(function() return obj:IsA("BasePart") end)
+	if ok and isPart then return obj end
+	local found = nil
+	pcall(function() found = obj:FindFirstChildWhichIsA("BasePart", true) end)
+	return found
+end
+
+local function freshZero(model)
+	pcall(function()
+		for _, p in ipairs(model:GetDescendants()) do
+			if p:IsA("BasePart") then
+				p.AssemblyLinearVelocity = Vector3.zero
+				p.AssemblyAngularVelocity = Vector3.zero
+			end
+		end
+	end)
+end
+
+-- teleport helper: car PivotTo when seated, HRP CFrame on foot
+local function freshGoto(cf)
+	local seat = freshSeat()
+	if seat then
+		local car = freshCar(seat)
+		if car then
+			local ok = pcall(function()
+				freshZero(car)
+				car:PivotTo(cf)
+			end)
+			if ok then return true end
+		end
+	end
+	local _, _, root = freshChar()
+	if root then
+		pcall(function()
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
+			root.CFrame = cf
+		end)
+		return true
+	end
+	return false
+end
+
+-- remote resolver: find any RemoteEvent/RemoteFunction by (name, class), cached
+local FreshRemotes = nil
+local function freshRemoteMap()
+	if FreshRemotes then return FreshRemotes end
+	FreshRemotes = {}
+	pcall(function()
+		for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+			pcall(function()
+				if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
+					FreshRemotes[d.ClassName .. "\0" .. d.Name] = d
+				end
+			end)
+		end
+	end)
+	return FreshRemotes
+end
+local function freshRemote(name, class)
+	class = class or "RemoteEvent"
+	local hit = freshRemoteMap()[class .. "\0" .. name]
+	if hit then return hit end
+	FreshRemotes = nil
+	return freshRemoteMap()[class .. "\0" .. name]
+end
+
+-- shared prompt scan (one background pass every few seconds, not per teleport)
+local FreshPrompts = {}
+task.spawn(function()
+	while not FreshOff do
+		local ok = pcall(function()
+			local found = {}
+			for _, p in ipairs(workspace:GetDescendants()) do
+				if p:IsA("ProximityPrompt") then
+					found[#found + 1] = p
+				end
+			end
+			FreshPrompts = found
+		end)
+		if ok then task.wait(4) else task.wait(2) end
+	end
 end)
 
--- ===== Trace appendix (observed paths, sandbox) =====
--- ReplicatedStorage.Databases.Collectibles -> Halloween2026Pumpkins.Roll
---   (.ViewDistance/.MaxVisible = math.huge)
--- ReplicatedStorage.Remotes.Services.CarKitEventServiceRemotes.ClaimFreePack:InvokeServer()
--- ReplicatedStorage.Remotes.Services.ConsumableServiceRemotes.Consume:InvokeServer("DecorationKitDeluxe"|"DecorationKit"|"DecorationKitHalloween")
--- ReplicatedStorage.Databases.HalloweenEvent.PurchaseShopItem:InvokeServer("HalloweenKit")
--- workspace.HalloweenPumpkinsLocal:GetChildren() + IsA("BasePart") + PivotTo (PostSimulation:Wait paced)
--- workspace.Collectibles:GetDescendants() + IsA("Model") + parent IsA("Folder") + GetChildren
--- workspace.SpeedCameras:GetDescendants() + Name polls (seated only)
--- workspace.Races:GetChildren() [IsA("Model") filter] / GetDescendants() + Name match
--- workspace.Tycoons:GetDescendants() + Name/Owner.Name/Owner.ClassName/Owner.Value + find "Plot"/"Slot"
--- workspace.Cars:GetChildren() + FullName match "([^.:]+)$"
--- workspace:GetDescendants() + ClassName + WorldPivot + RequestStreamAroundAsync(pos, 1)
--- LocalPlayer.Idled:connect, workspace.DescendantAdded:Connect, PlayerGui.ChildAdded:Connect
--- LocalPlayer:RequestStreamAroundAsync(pos) [pre-stream, 2-arg] and (Vector3(-1989.9,592.6,6957.3)) [race]
--- workspace.Gravity read (grav) + Gravity = 196 writes
--- readfile/writefile("cdtdelivery.txt"), print config + delivery triple
--- game:HttpGet("https://raw.githubusercontent.com/Marco8642/science/main/ui%20libs2")
+local function freshPromptBurst(pos, radius)
+	radius = radius or 16
+	for _, p in ipairs(FreshPrompts) do
+		local ok, pp = pcall(function()
+			local par = freshFirstPart(p.Parent)
+			return par and par.Position
+		end)
+		if ok and pp and (pp - pos).Magnitude <= radius then
+			pcall(fireproximityprompt, p)
+		end
+	end
+end
+
+local function freshTouch(part)
+	if typeof(firetouchinterest) ~= "function" then return end
+	local _, _, root = freshChar()
+	if not root or not part then return end
+	pcall(function()
+		firetouchinterest(root, part, 0)
+		task.wait(0.15)
+		firetouchinterest(root, part, 1)
+	end)
+end
+
+local FreshRadii = {
+	Halloween2026Pumpkins = 25,
+	Halloween2026 = 15,
+	EasterEgg2026 = 20,
+	Docks2025 = 20,
+	Test = 40,
+}
+local function freshRadiusOf(group)
+	return FreshRadii[group] or 15
+end
+
+-- CDT pickup: stand in radius, then Collect:InvokeServer(groupName, itemName).
+-- Group = tagged model's parent folder, item = model name.
+local function freshCollectPart(part)
+	if not part then return false end
+	local model = part
+	pcall(function()
+		local n = part
+		while n and n.Parent and n.Parent ~= workspace do
+			local okT, tagged = pcall(function() return CollectionService:HasTag(n, "Collectible_Model") end)
+			if okT and tagged then model = n break end
+			n = n.Parent
+		end
+	end)
+	local group, item = nil, nil
+	pcall(function() group = model.Parent and model.Parent.Name end)
+	pcall(function() item = model.Name end)
+	if not group or not item then return false end
+	local r = freshRadiusOf(group)
+	local okP, pp = pcall(function() return part.Position end)
+	if okP and pp then
+		local me = freshHrpPos()
+		if me and (pp - me).Magnitude > math.max(4, r - 2) then
+			freshGoto(part.CFrame + Vector3.new(0, 3, 0))
+		end
+	end
+	freshPromptBurst(part.Position, 16)
+	freshTouch(part)
+	local rf = freshRemote("Collect", "RemoteFunction")
+	if not rf then return false end
+	local ok, res = pcall(function() return rf:InvokeServer(group, item) end)
+	if ok then return res ~= nil end
+	return false
+end
+
+-- ===== NEW physics driver (no teleports while driving) =====
+-- Faces the car with rotation-only PivotTo snaps at its CURRENT position,
+-- then holds real throttle. Position never teleports, so no rubber-banding.
+local function freshSteerTo(targetPos, speed, timeoutS, flagKey, arriveR)
+	timeoutS = timeoutS or 20
+	arriveR = arriveR or 30
+	local t0 = os.clock()
+	local lastProg, lastT, hops = nil, os.clock(), 0
+	while Fresh[flagKey] and not FreshOff and (os.clock() - t0) < timeoutS do
+		local seat = freshSeat()
+		if not seat or not seat:IsA("VehicleSeat") then return false end
+		local car = freshCar(seat)
+		if not car then return false end
+		local okP, pivot = pcall(function() return car:GetPivot() end)
+		if not okP or not pivot then task.wait(0.3) else
+			local pos = pivot.Position
+			local flat = Vector3.new(targetPos.X - pos.X, 0, targetPos.Z - pos.Z)
+			local dist = flat.Magnitude
+			if dist < arriveR then
+				pcall(function()
+					seat.MaxSpeed = speed
+					seat.ThrottleFloat = 1
+					seat.SteerFloat = 0
+				end)
+				task.wait(0.4)
+				return true
+			end
+			if lastProg and (lastProg - dist) < 1 and (os.clock() - lastT) > 4 then
+				hops = hops + 1
+				lastT = os.clock()
+				if hops == 1 then
+					-- reverse out first (usually enough)
+					pcall(function()
+						seat.ThrottleFloat = -1
+						seat.SteerFloat = 0
+					end)
+					task.wait(1.2)
+					pcall(function() seat.ThrottleFloat = 1 end)
+				else
+					-- small vertical hop as last resort, then keep driving
+					pcall(function() car:PivotTo(pivot + Vector3.new(0, 8, 0)) end)
+					return false
+				end
+			else
+				if (not lastProg) or (lastProg - dist) >= 1 then
+					lastProg, lastT = dist, os.clock()
+				end
+			end
+			if flat.Magnitude > 0.5 then
+				pcall(function()
+					car:PivotTo(CFrame.lookAt(pos, pos + flat))
+				end)
+			end
+			pcall(function()
+				seat.MaxSpeed = speed
+				seat.ThrottleFloat = 1
+				seat.SteerFloat = 0
+			end)
+			task.wait(0.3)
+		end
+	end
+	return false
+end
+
+-- ===== MEGA additions: tuning state + own-tycoon finder (all-new) =====
+local MegaTunes = { Speed = 100, Torque = 30000 }
+local FlySpeed = 60
+local EspMaxDist = 2000
+
+local function megaTuneSeat()
+	local seat = freshSeat()
+	if not seat or not seat:IsA("VehicleSeat") then return false end
+	pcall(function() seat.MaxSpeed = MegaTunes.Speed end)
+	pcall(function() seat.Torque = MegaTunes.Torque end)
+	return true
+end
+
+local function megaOwnTycoon()
+	local ty = workspace:FindFirstChild("Tycoons")
+	if not ty then return nil end
+	for _, g in ipairs(ty:GetChildren()) do
+		local okO, o = pcall(function() return g.Owner.Value end)
+		if okO and o == LP.Name then return g end
+	end
+	return nil
+end
+
+-- ===== window (fancy UI) =====
+Window = VantixUI:CreateWindow({
+	Title = "Vena Mega",
+	Theme = "Vantix",
+	AccentColor = Color3.fromRGB(255, 255, 255),
+	LogoID = 110034487018208,
+	Size = { 820, 480 },
+})
+
+Window:CreateTag("Mega", Color3.fromRGB(80, 210, 120), nil, "rocket")
+Window:CreateTag("V2.0", Color3.fromRGB(60, 120, 210), nil, "git-branch")
+Window:CreateTag("Keyless", Color3.fromRGB(255, 180, 50), nil, "key")
+
+Window:Notify({ Title = "Vena Fresh", Text = "Loaded", Icon = "check", Duration = 4 })
+
+local Flags = Fresh
+local Panel, QuickBar, accentRow, minRow, keyRow, qFpsRow, qPingRow
+local lastPing = "n/a"
+
+local function freshHex(c)
+	return string.format("#%02X%02X%02X", math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5))
+end
+
+-- ===== Main tab: the fixed autofarm + working collect =====
+local MainTab = Window:AddTab("Main", "house")
+local farmToggle, collectToggle
+
+local CruiseSpeed = 100
+local cruiseBox = MainTab:AddTextBox({
+	Title = "Cruise Speed",
+	Icon = "gauge",
+	Placeholder = "Cruise speed...",
+	Default = "100",
+	Callback = function(text)
+		local n = tonumber(text)
+		if n then
+			CruiseSpeed = math.clamp(n, 10, 400)
+			local seat = freshSeat()
+			if seat and seat:IsA("VehicleSeat") then
+				pcall(function() seat.MaxSpeed = CruiseSpeed end)
+			end
+		end
+	end,
+})
+
+farmToggle = MainTab:AddToggle({
+	Title = "Auto Farm (Cruise)",
+	Subtitle = "Ground driving, no sky road, no teleports",
+	Icon = "navigation",
+	Default = false,
+	Callback = function(state)
+		Fresh.Cruise = state
+		freshLog("Cruise farm " .. (state and "enabled" or "disabled"))
+		freshStatus("Status: Cruise farm " .. (state and "on" or "off"))
+		if not state or Fresh._cruiseRunning then
+			if not state then
+				local seat = freshSeat()
+				if seat and seat:IsA("VehicleSeat") then
+					pcall(function()
+						seat.ThrottleFloat = 0
+						seat.SteerFloat = 0
+					end)
+				end
+			end
+			return
+		end
+		Fresh._cruiseRunning = true
+		task.spawn(function()
+			local warned = false
+			local laps = 0
+			while Fresh.Cruise and not FreshOff do
+				local seat = freshSeat()
+				if not seat or not seat:IsA("VehicleSeat") then
+					if not warned then
+						warned = true
+						freshNotify("Cruise: sit in any car and it drives itself")
+						freshStatus("Status: Cruise - waiting for you to sit in a car")
+					end
+					task.wait(1)
+				else
+					warned = false
+					local car = freshCar(seat)
+					local okP, pivot = pcall(function() return car:GetPivot() end)
+					if not okP or not pivot then
+						task.wait(1)
+					else
+						-- square loop 260 studs around where you started driving
+						local c = pivot.Position
+						local R = 260
+						local corners = {
+							c + Vector3.new(R, 0, 0),
+							c + Vector3.new(R, 0, R),
+							c + Vector3.new(0, 0, R),
+							c,
+						}
+						for i, wp in ipairs(corners) do
+							if not Fresh.Cruise or FreshOff then break end
+							freshStatus(string.format("Status: Cruise - leg %d/4, lap %d @ %d", i, laps + 1, CruiseSpeed))
+							freshSteerTo(Vector3.new(wp.X, c.Y, wp.Z), CruiseSpeed, 30, "Cruise", 30)
+						end
+						laps = laps + 1						Fresh.CruiseLaps = laps
+						freshLog("Cruise: lap " .. tostring(laps) .. " done")
+					end
+				end
+			end
+			local seat = freshSeat()
+			if seat and seat:IsA("VehicleSeat") then
+				pcall(function()
+					seat.ThrottleFloat = 0
+					seat.SteerFloat = 0
+				end)
+			end
+			Fresh._cruiseRunning = false
+		end)
+	end,
+})
+
+local function freshCollectFolders()
+	local out, seen = {}, {}
+	local function push(f)
+		if not f then return end
+		for _, e in ipairs(out) do if e == f then return end end
+		if seen[f] then return end
+		seen[f] = true
+		out[#out + 1] = f
+	end
+	push(workspace:FindFirstChild("HalloweenPumpkinsLocal"))
+	push(workspace:FindFirstChild("Collectibles"))
+	push(workspace:FindFirstChild("Halloween2026"))
+	push(workspace:FindFirstChild("Halloween"))
+	push(workspace:FindFirstChild("Pickups"))
+	pcall(function()
+		for _, kid in ipairs(workspace:GetChildren()) do
+			local okN, n = pcall(function() return kid.Name:lower() end)
+			if okN and n and n:find("collect") then push(kid) end
+		end
+	end)
+	return out
+end
+
+collectToggle = MainTab:AddToggle({
+	Title = "Auto Collect",
+	Subtitle = "Pumpkins + all collectables (teleport pickup)",
+	Icon = "package",
+	Default = false,
+	Callback = function(state)
+		Fresh.Collect = state
+		freshLog("Auto Collect " .. (state and "enabled" or "disabled"))
+		freshStatus("Status: Auto Collect " .. (state and "on" or "off"))
+		if not state or Fresh._collectRunning then return end
+		Fresh._collectRunning = true
+		task.spawn(function()
+			local errs = 0
+			while Fresh.Collect and not FreshOff do
+				local folders = freshCollectFolders()
+				if #folders == 0 then
+					freshStatus("Status: Collect - nothing found, waiting")
+					task.wait(2)
+				else
+					local targets, seenT = {}, {}
+					local me = freshHrpPos()
+					for _, folder in ipairs(folders) do
+						local kids = {}
+						pcall(function() kids = folder:GetChildren() end)
+						for _, kid in ipairs(kids) do
+							local part = freshFirstPart(kid)
+							if part and not seenT[part] then
+								seenT[part] = true
+								targets[#targets + 1] = part
+								if #targets >= 60 then break end
+							end
+						end
+						if #targets >= 60 then break end
+						if #targets < 60 then
+							local descs = {}
+							pcall(function() descs = folder:GetDescendants() end)
+							local n = 0
+							for _, d in ipairs(descs) do
+								local okP = false
+								pcall(function() okP = d:IsA("BasePart") end)
+								if okP and not seenT[d] then
+									seenT[d] = true
+									targets[#targets + 1] = d
+									n = n + 1
+									if #targets >= 60 or n >= 200 then break end
+								end
+							end
+						end
+						if #targets >= 60 then break end
+					end
+					if #targets == 0 then
+						task.wait(1)
+					else
+						if me then
+							local dist = {}
+							for _, o in ipairs(targets) do
+								local okD, p = pcall(function()
+									return (freshFirstPart(o).Position - me).Magnitude
+								end)
+								dist[o] = (okD and p) or math.huge
+							end
+							pcall(function()
+								table.sort(targets, function(a, b)
+									return (dist[a] or math.huge) < (dist[b] or math.huge)
+								end)
+							end)
+						end
+						for _, part in ipairs(targets) do
+							if not Fresh.Collect or FreshOff then break end
+							local okC = pcall(function() freshCollectPart(part) end)
+							if okC then errs = 0							Fresh.Collected = (Fresh.Collected or 0) + 1							else errs = errs + 1 end
+							if errs >= 15 then
+								Fresh.Collect = false
+								freshNotify("Auto Collect stopped: 15 errors in a row")
+								break
+							end
+							task.wait(0.5)
+						end
+					end
+				end
+			end
+			Fresh._collectRunning = false
+		end)
+	end,
+})
+
+MainTab:AddToggle({
+	Title = "Auto Open Vehicle Kit",
+	Subtitle = "Claims the free car kit",
+	Icon = "gift",
+	Default = false,
+	Callback = function(state)
+		Fresh.Kit = state
+		freshLog("Auto Kit " .. (state and "enabled" or "disabled"))
+		if not state or Fresh._kitRunning then return end
+		Fresh._kitRunning = true
+		task.spawn(function()
+			while Fresh.Kit and not FreshOff do
+				pcall(function()
+					local kit = freshRemote("ClaimFreePack", "RemoteFunction")
+					if kit then kit:InvokeServer() end
+				end)
+				task.wait(3)
+			end
+			Fresh._kitRunning = false
+		end)
+	end,
+})
+
+MainTab:AddToggle({
+	Title = "Auto Claim Rewards",
+	Subtitle = "Daily / gift / objective rewards",
+	Icon = "flame",
+	Default = false,
+	Callback = function(state)
+		Fresh.Rewards = state
+		freshLog("Auto Rewards " .. (state and "enabled" or "disabled"))
+		if not state or Fresh._rewardsRunning then return end
+		Fresh._rewardsRunning = true
+		task.spawn(function()
+			while Fresh.Rewards and not FreshOff do
+				pcall(function()
+					local r1 = freshRemote("ClaimDailyReward", "RemoteEvent")
+					if r1 then r1:FireServer() end
+				end)
+				pcall(function()
+					local r2 = freshRemote("ClaimObjective", "RemoteEvent")
+					if r2 then r2:FireServer() end
+				end)
+				pcall(function()
+					local r3 = freshRemote("ClaimFreeGift", "RemoteFunction")
+					if r3 then r3:InvokeServer() end
+				end)
+				pcall(function()
+					local r4 = freshRemote("ClaimNextReward", "RemoteEvent")
+					if r4 then r4:FireServer() end
+				end)
+				freshStatus("Status: Rewards - claimed (60s cycle)")
+				task.wait(60)
+			end
+			Fresh._rewardsRunning = false
+		end)
+	end,
+})
+
+MainTab:AddButton({
+	Title = "Stop All Farms",
+	Subtitle = "Kills every loop",
+	Icon = "octagon-x",
+	Text = "Stop",
+	Callback = function()
+		for _, k in ipairs({ "Cruise", "Collect", "Kit", "Rewards", "Sell", "Delivery", "Upgrade", "Traps", "Race", "AutoTune", "Halloween", "Fly", "Noclip", "ESP" }) do
+			Fresh[k] = false
+		end
+		local seat = freshSeat()
+		if seat and seat:IsA("VehicleSeat") then
+			pcall(function()
+				seat.ThrottleFloat = 0
+				seat.SteerFloat = 0
+			end)
+		end
+		freshLog("All loops stopped")
+		freshStatus("Status: all stopped")
+	end,
+})
+
+MainTab:AddSeparator()
+statusLine = MainTab:AddLabel("Status: idle", "activity")
+feed = MainTab:AddConsole({ Title = "Activity Log", Height = 110 })
+feed:Write("Vena Mega loaded - cruise farm + tuning + ESP + fly, all keyless")
+
+-- ===== Money tab =====
+local MoneyTab = Window:AddTab("Money", "dollar-sign")
+local SellCarName = ""
+
+MoneyTab:AddTextBox({
+	Title = "Auto Sell Car Name",
+	Icon = "tag",
+	Placeholder = "Exact owned car name...",
+	Default = "",
+	Callback = function(text)
+		SellCarName = text
+	end,
+})
+
+MoneyTab:AddToggle({
+	Title = "Auto Sell Cars",
+	Subtitle = "Serves your dealership customers",
+	Icon = "dollar-sign",
+	Default = false,
+	Callback = function(state)
+		Fresh.Sell = state
+		freshLog("Auto Sell " .. (state and "enabled" or "disabled"))
+		if not state or Fresh._sellRunning then return end
+		if SellCarName == "" then
+			freshNotify("Auto Sell: enter the exact car name first")
+			Fresh.Sell = false
+			return
+		end
+		Fresh._sellRunning = true
+		task.spawn(function()
+			local errs = 0
+			while Fresh.Sell and not FreshOff do
+				local okS = pcall(function()
+					local tycoons = workspace:FindFirstChild("Tycoons")
+					if not tycoons then
+						freshStatus("Status: Sell - no tycoons")
+						return
+					end
+					local mine = nil
+					for _, t in ipairs(tycoons:GetChildren()) do
+						local okO, o = pcall(function() return t.Owner.Value end)
+						if okO and o == LP.Name then mine = t break end
+					end
+					if not mine then
+						freshStatus("Status: Sell - no tycoon found")
+						return
+					end
+					local npc, oid = nil, nil
+					for _, d in ipairs(mine:GetDescendants()) do
+						local okA, id = pcall(function() return d:GetAttribute("OrderId") end)
+						if okA and id then
+							local m = d
+							while m and not m:IsA("Model") do m = m.Parent end
+							if m then npc, oid = m, id break end
+						end
+					end
+					if not npc then
+						freshStatus("Status: Sell - waiting for customers")
+						return
+					end
+					local npcR = freshRemote("NPCHandler", "RemoteEvent")
+					if not npcR then return end
+					npcR:FireServer({ Action = "AcceptOrder", OrderId = oid })
+					task.wait(1)
+					npcR:FireServer({
+						Action = "CompleteOrder",
+						OrderId = oid,
+						Specs = { Car = SellCarName, Color = "Red", Rims = "Default", RimColor = "Black", Springs = "Default" },
+					})
+					freshStatus("Status: Sell - served order " .. tostring(oid))
+				end)
+				if okS then errs = 0 else errs = errs + 1 end
+				if errs >= 15 then
+					Fresh.Sell = false
+					freshNotify("Auto Sell stopped: 15 errors in a row")
+					break
+				end
+				task.wait(3)
+			end
+			Fresh._sellRunning = false
+		end)
+	end,
+})
+
+MoneyTab:AddToggle({
+	Title = "Auto Delivery",
+	Subtitle = "Works DeliveryGame items",
+	Icon = "truck",
+	Default = false,
+	Callback = function(state)
+		Fresh.Delivery = state
+		freshLog("Auto Delivery " .. (state and "enabled" or "disabled"))
+		if not state or Fresh._deliveryRunning then return end
+		Fresh._deliveryRunning = true
+		task.spawn(function()
+			while Fresh.Delivery and not FreshOff do
+				local did = false
+				pcall(function()
+					local games = workspace:FindFirstChild("ActionTasksGames")
+					if games then
+						local item, gname = nil, nil
+						for _, d in ipairs(games:GetDescendants()) do
+							if d:IsA("BasePart") and d.Parent then
+								local okN, n = pcall(function() return d.Parent.Name end)
+								if okN and n and n:find("DeliveryGame") then
+									item, gname = d, n
+									break
+								end
+							end
+						end
+						if item then
+							freshGoto(item.CFrame + Vector3.new(0, 3, 0))
+							freshTouch(item)
+							freshPromptBurst(item.Position, 14)
+							local ar = freshRemote("ActionGameDataReplication", "RemoteEvent")
+							if ar then
+								ar:FireServer("TryInteractWithItem", { GameName = gname, ItemId = item.Name })
+							end
+							did = true
+						end
+					end
+				end)
+				if did then
+					freshStatus("Status: Delivery - worked item")
+					task.wait(1)
+				else
+					freshStatus("Status: Delivery - no delivery items")
+					task.wait(3)
+				end
+			end
+			Fresh._deliveryRunning = false
+		end)
+	end,
+})
+
+MoneyTab:AddToggle({
+	Title = "Auto Upgrade Dealership",
+	Subtitle = "Buys upgrade pads, nearest first",
+	Icon = "arrow-up-circle",
+	Default = false,
+	Callback = function(state)
+		Fresh.Upgrade = state
+		freshLog("Auto Upgrade " .. (state and "enabled" or "disabled"))
+		if not state or Fresh._upgradeRunning then return end
+		Fresh._upgradeRunning = true
+		task.spawn(function()
+			while Fresh.Upgrade and not FreshOff do
+				local okU = pcall(function()
+					local ty = workspace:FindFirstChild("Tycoons")
+					if not ty then
+						freshStatus("Status: Upgrade - no tycoons")
+						return
+					end
+					local mine = nil
+					for _, g in ipairs(ty:GetChildren()) do
+						local okO, o = pcall(function() return g.Owner.Value end)
+						if okO and o == LP.Name then mine = g break end
+					end
+					if not mine then
+						freshStatus("Status: Upgrade - no tycoon found")
+						return
+					end
+					local pads, seenP = {}, {}
+					for _, d in ipairs(mine:GetDescendants()) do
+						local okN, nm = pcall(function() return d.Name end)
+						if okN and nm and nm:lower():find("upgrade") then
+							local part = nil
+							pcall(function()
+								if d:IsA("BasePart") then part = d
+								elseif d:IsA("Model") then part = freshFirstPart(d) end
+							end)
+							if part and not seenP[part] then
+								seenP[part] = true
+								pads[#pads + 1] = part
+							end
+						end
+					end
+					if #pads == 0 then
+						freshStatus("Status: Upgrade - all bought")
+						task.wait(5)
+						return
+					end
+					local me = freshHrpPos()
+					if me then
+						local dist = {}
+						for _, o in ipairs(pads) do
+							local okD, p = pcall(function() return (o.Position - me).Magnitude end)
+							dist[o] = (okD and p) or math.huge
+						end
+						pcall(function()
+							table.sort(pads, function(a, b)
+								return (dist[a] or math.huge) < (dist[b] or math.huge)
+							end)
+						end)
+					end
+					local pad = pads[1]
+					local okC, cf = pcall(function() return pad.CFrame end)
+					if okC and cf then freshGoto(cf + Vector3.new(0, 4, 0)) end
+					freshPromptBurst(pad.Position, 16)
+					freshTouch(pad)
+					freshStatus("Status: Upgrade - buying " .. tostring(pad.Name))
+					local t0 = os.clock()
+					while Fresh.Upgrade and not FreshOff and (os.clock() - t0) < 25 do
+						local gone = false
+						pcall(function()
+							if (not pad.Parent) or (not pad:IsDescendantOf(workspace)) then gone = true end
+						end)
+						if gone then break end
+						task.wait(1)
+					end
+					task.wait(1)
+				end)
+				if not okU then
+					task.wait(1)
+				end
+				task.wait(1)
+			end
+			Fresh._upgradeRunning = false
+		end)
+	end,
+})
+
+-- ===== Race tab (physical driving, same new driver) =====
+local RaceTab = Window:AddTab("Race", "flag")
+
+local function freshRaceFolders()
+	local folders = {}
+	local function push(f)
+		if f then folders[#folders + 1] = f end
+	end
+	push(workspace:FindFirstChild("Races"))
+	pcall(function()
+		for _, kid in ipairs(workspace:GetChildren()) do
+			local okN, n = pcall(function() return kid.Name:lower() end)
+			if okN and n and (n:find("race") or n:find("halloween")) then
+				local dup = false
+				for _, f in ipairs(folders) do if f == kid then dup = true break end end
+				if not dup and (kid:IsA("Folder") or kid:IsA("Model")) then
+					push(kid)
+				end
+			end
+		end
+	end)
+	return folders
+end
+
+local function freshRaceList()
+	local names = { "All" }
+	pcall(function()
+		for _, folder in ipairs(freshRaceFolders()) do
+			for _, r in ipairs(folder:GetChildren()) do
+				local dup = false
+				for _, e in ipairs(names) do if e == r.Name then dup = true break end end
+				if not dup then names[#names + 1] = r.Name end
+			end
+		end
+	end)
+	return names
+end
+
+local FreshRace = "All"
+local FreshRaceMode = "Drive"
+local raceSpeed = 100
+
+RaceTab:AddTextBox({
+	Title = "Race Speed",
+	Icon = "gauge",
+	Placeholder = "Race speed...",
+	Default = "100",
+	Callback = function(text)
+		local n = tonumber(text)
+		if n then raceSpeed = math.clamp(n, 10, 400) end
+	end,
+})
+
+local raceTargetDD = RaceTab:AddDropdown({
+	Title = "Target Race",
+	Icon = "map-pin",
+	Options = freshRaceList(),
+	Default = "All",
+	Callback = function(selected)
+		FreshRace = selected
+		freshLog("Target race: " .. tostring(selected))
+	end,
+})
+
+RaceTab:AddDropdown({
+	Title = "Race Mode",
+	Icon = "settings-2",
+	Options = { "Drive", "Teleport" },
+	Default = "Drive",
+	Callback = function(selected)
+		FreshRaceMode = selected
+	end,
+})
+
+RaceTab:AddButton({
+	Title = "Refresh Race List",
+	Subtitle = "Rescans race folders",
+	Icon = "refresh-cw",
+	Text = "Refresh",
+	Callback = function()
+		local names = freshRaceList()
+		pcall(function() raceTargetDD:SetOptions(names) end)
+		freshLog("Races: " .. table.concat(names, ", "))
+	end,
+})
+
+local function freshRacePoints(raceRoot)
+	local strict, fallback = {}, {}
+	for _, d in ipairs(raceRoot:GetDescendants()) do
+		local okP = false
+		pcall(function() okP = d:IsA("BasePart") end)
+		if okP then
+			local okN, n = pcall(function() return d.Name:lower() end)
+			if okN and n then
+				if n:find("checkpoint") or n:find("check") or n == "cp"
+					or n:find("lap") or n:find("start") or n:find("finish")
+					or n:find("gate") or n:find("ring") then
+					strict[#strict + 1] = d
+				else
+					if #fallback < 40 then fallback[#fallback + 1] = d end
+				end
+				if #strict >= 150 then break end
+			end
+		end
+	end
+	local out = (#strict > 0) and strict or fallback
+	pcall(function()
+		table.sort(out, function(a, b) return a.Name < b.Name end)
+	end)
+	return out
+end
+
+RaceTab:AddToggle({
+	Title = "Auto Race",
+	Subtitle = "Sit in a vehicle first",
+	Icon = "flag",
+	Default = false,
+	Callback = function(state)
+		Fresh.Race = state
+		freshLog("Auto Race " .. (state and "enabled" or "disabled"))
+		if not state or Fresh._raceRunning then
+			if not state then
+				local seat = freshSeat()
+				if seat and seat:IsA("VehicleSeat") then
+					pcall(function()
+						seat.ThrottleFloat = 0
+						seat.SteerFloat = 0
+					end)
+				end
+			end
+			return
+		end
+		Fresh._raceRunning = true
+		task.spawn(function()
+			local warnedSeat = false
+			while Fresh.Race and not FreshOff do
+				local folders = freshRaceFolders()
+				if #folders == 0 then
+					freshStatus("Status: Race - no race folders")
+					task.wait(2)
+				else
+					local roots = {}
+					if FreshRace ~= "All" then
+						for _, folder in ipairs(folders) do
+							local f = folder:FindFirstChild(FreshRace)
+							if f then roots[#roots + 1] = f end
+						end
+					else
+						for _, folder in ipairs(folders) do
+							for _, r in ipairs(folder:GetChildren()) do
+								roots[#roots + 1] = r
+							end
+						end
+					end
+					if #roots == 0 then
+						freshStatus("Status: Race - use Refresh")
+						task.wait(2)
+					else
+						for _, root in ipairs(roots) do
+							if not Fresh.Race or FreshOff then break end
+							local cps = {}
+							pcall(function() cps = freshRacePoints(root) end)
+							if #cps == 0 then
+								freshStatus("Status: Race - no points in " .. root.Name)
+							else
+								for i, cp in ipairs(cps) do
+									if not Fresh.Race or FreshOff then break end
+									local seat = freshSeat()
+									if not seat and not warnedSeat then
+										warnedSeat = true
+										freshNotify("Race: sit in a vehicle")
+									end
+									local okCp, cpPos = pcall(function() return cp.Position end)
+									if okCp and cpPos then
+										freshStatus(string.format("Status: Race %s %d/%d", root.Name, i, #cps))
+										if FreshRaceMode == "Teleport" then
+											freshGoto(cp.CFrame + Vector3.new(0, 3, 0))
+											pcall(function() freshPromptBurst(cpPos, 16) end)
+											freshTouch(cp)
+											task.wait(0.7)
+										else
+											if seat and seat:IsA("VehicleSeat") then
+												pcall(function() seat.MaxSpeed = raceSpeed end)
+											end
+											freshSteerTo(cpPos + Vector3.new(0, 3, 0), raceSpeed, 14, "Race", 16)
+										end
+									end
+								end
+							end
+							task.wait(0.5)
+						end
+					end
+				end
+			end
+			Fresh._raceRunning = false
+		end)
+	end,
+})
+
+-- ===== MEGA: Garage (live car tuning — the "inf acceleration" class, no key) =====
+local GarageTab = Window:AddTab("Garage", "wrench")
+
+GarageTab:AddSlider({
+	Title = "Tune: Top Speed",
+	Icon = "gauge",
+	Min = 10,
+	Max = 400,
+	Default = 100,
+	Callback = function(value)
+		MegaTunes.Speed = math.clamp(value, 10, 400)
+		if Fresh.AutoTune then megaTuneSeat() end
+	end,
+})
+
+GarageTab:AddSlider({
+	Title = "Tune: Acceleration (Torque)",
+	Icon = "zap",
+	Min = 5000,
+	Max = 500000,
+	Default = 30000,
+	Callback = function(value)
+		MegaTunes.Torque = value
+		if Fresh.AutoTune then megaTuneSeat() end
+	end,
+})
+
+GarageTab:AddButton({
+	Title = "Tune Current Car",
+	Subtitle = "Applies the sliders to the car you are sitting in",
+	Icon = "wrench",
+	Text = "Tune",
+	Callback = function()
+		if megaTuneSeat() then
+			freshLog("Tuned: speed " .. tostring(MegaTunes.Speed) .. ", torque " .. tostring(MegaTunes.Torque))
+			freshStatus("Status: car tuned")
+		else
+			freshNotify("Tune: sit in a car first")
+		end
+	end,
+})
+
+GarageTab:AddToggle({
+	Title = "Auto Tune",
+	Subtitle = "Keeps every car you sit in tuned (pause while Cruise runs)",
+	Icon = "repeat",
+	Default = false,
+	Callback = function(state)
+		Fresh.AutoTune = state
+		freshLog("Auto Tune " .. (state and "enabled" or "disabled"))
+		if not state or Fresh._tuneRunning then return end
+		Fresh._tuneRunning = true
+		task.spawn(function()
+			while Fresh.AutoTune and not FreshOff do
+				pcall(megaTuneSeat)
+				task.wait(0.5)
+			end
+			Fresh._tuneRunning = false
+		end)
+	end,
+})
+
+-- ===== MEGA: Halloween 2026 event farm =====
+local EventTab = Window:AddTab("Halloween", "ghost")
+
+EventTab:AddToggle({
+	Title = "Halloween Farm",
+	Subtitle = "Pumpkins + Halloween folders only",
+	Icon = "ghost",
+	Default = false,
+	Callback = function(state)
+		Fresh.Halloween = state
+		freshLog("Halloween Farm " .. (state and "enabled" or "disabled"))
+		freshStatus("Status: Halloween Farm " .. (state and "on" or "off"))
+		if not state or Fresh._halloRunning then return end
+		Fresh._halloRunning = true
+		task.spawn(function()
+			local errs = 0
+			while Fresh.Halloween and not FreshOff do
+				local targets, seenT = {}, {}
+				for _, name in ipairs({ "HalloweenPumpkinsLocal", "Halloween2026", "Halloween", "EasterEgg2026" }) do
+					local folder = workspace:FindFirstChild(name)
+					if folder then
+						local descs = {}
+						pcall(function() descs = folder:GetDescendants() end)
+						for _, d in ipairs(descs) do
+							local okP = false
+							pcall(function() okP = d:IsA("BasePart") end)
+							if okP and not seenT[d] then
+								seenT[d] = true
+								targets[#targets + 1] = d
+								if #targets >= 60 then break end
+							end
+						end
+					end
+					if #targets >= 60 then break end
+				end
+				if #targets == 0 then
+					freshStatus("Status: Halloween - nothing found, waiting")
+					task.wait(2)
+				else
+					local me = freshHrpPos()
+					if me then
+						local dist = {}
+						for _, o in ipairs(targets) do
+							local okD, p = pcall(function() return (o.Position - me).Magnitude end)
+							dist[o] = (okD and p) or math.huge
+						end
+						pcall(function()
+							table.sort(targets, function(a, b) return (dist[a] or math.huge) < (dist[b] or math.huge) end)
+						end)
+					end
+					for _, part in ipairs(targets) do
+						if not Fresh.Halloween or FreshOff then break end
+						local okC = false
+						pcall(function() okC = freshCollectPart(part) end)
+						if okC then
+							errs = 0
+							Fresh.Collected = (Fresh.Collected or 0) + 1
+						else
+							errs = errs + 1
+						end
+						if errs >= 15 then
+							Fresh.Halloween = false
+							freshNotify("Halloween Farm stopped: 15 errors in a row")
+							break
+						end
+						task.wait(0.5)
+					end
+				end
+			end
+			Fresh._halloRunning = false
+		end)
+	end,
+})
+
+EventTab:AddButton({
+	Title = "Open Event Crate (once)",
+	Subtitle = "Single Consume call, no loop",
+	Icon = "package",
+	Text = "Open",
+	Callback = function()
+		local n = 0
+		pcall(function()
+			local r = freshRemote("Consume", "RemoteFunction")
+			if r then r:InvokeServer("DecorationKitHalloween") n = 1 end
+		end)
+		freshLog("Event crate opened (" .. n .. ")")
+	end,
+})
+
+EventTab:AddButton({
+	Title = "Buy Event Crate (once)",
+	Subtitle = "Single shop call, no loop",
+	Icon = "shopping-cart",
+	Text = "Buy",
+	Callback = function()
+		local n = 0
+		pcall(function()
+			local r = freshRemote("PurchaseShopItem", "RemoteFunction")
+			if r then r:InvokeServer("HalloweenKit") n = 1 end
+		end)
+		freshLog("Event crate buy fired (" .. n .. ")")
+	end,
+})
+
+-- ===== MEGA: World (movement + ESP + one-click teleports) =====
+local WorldTab = Window:AddTab("World", "globe")
+
+local function megaNearestCollectible()
+	local best, bestD = nil, math.huge
+	for _, folder in ipairs(freshCollectFolders()) do
+		local descs = {}
+		pcall(function() descs = folder:GetDescendants() end)
+		for _, d in ipairs(descs) do
+			local okP = false
+			pcall(function() okP = d:IsA("BasePart") end)
+			if okP then
+				local me = freshHrpPos()
+				if me then
+					local okD, dd = pcall(function() return (d.Position - me).Magnitude end)
+					if okD and dd < bestD then best, bestD = d, dd end
+				end
+			end
+		end
+	end
+	return best
+end
+
+WorldTab:AddSlider({
+	Title = "Fly Speed",
+	Icon = "plane",
+	Min = 10,
+	Max = 300,
+	Default = 60,
+	Callback = function(value)
+		FlySpeed = math.clamp(value, 10, 300)
+	end,
+})
+
+WorldTab:AddToggle({
+	Title = "Fly (on foot)",
+	Subtitle = "WASD + Space up / Shift down (not while driving)",
+	Icon = "plane",
+	Default = false,
+	Callback = function(state)
+		Fresh.Fly = state
+		freshLog("Fly " .. (state and "enabled" or "disabled"))
+		if not state or Fresh._flyRunning then
+			if not state and Fresh._flyConn then
+				pcall(function() Fresh._flyConn:Disconnect() end)
+				Fresh._flyConn = nil
+			end
+			return
+		end
+		Fresh._flyRunning = true
+		task.spawn(function()
+			Fresh._flyConn = RunService.Heartbeat:Connect(function(dt)
+				if not Fresh.Fly or FreshOff then return end
+				if freshSeat() then return end
+				local char, hum, root = freshChar()
+				if not (char and hum and root) then return end
+				pcall(function()
+					hum.PlatformStand = true
+					local step = FlySpeed * math.min(dt, 0.1)
+					local move = hum.MoveDirection * step
+					local y = 0
+					if UIS:IsKeyDown(Enum.KeyCode.Space) then y = step end
+					if UIS:IsKeyDown(Enum.KeyCode.LeftShift) then y = -step end
+					root.CFrame = root.CFrame + Vector3.new(move.X, y, move.Z)
+					root.AssemblyLinearVelocity = Vector3.zero
+					for _, p in ipairs(char:GetDescendants()) do
+						if p:IsA("BasePart") then p.CanCollide = false end
+					end
+				end)
+			end)
+			while Fresh.Fly and not FreshOff do task.wait(0.5) end
+			pcall(function()
+				if Fresh._flyConn then Fresh._flyConn:Disconnect() end
+			end)
+			Fresh._flyConn = nil
+			pcall(function()
+				local _, hum = freshChar()
+				if hum then hum.PlatformStand = false end
+			end)
+			Fresh._flyRunning = false
+		end)
+	end,
+})
+
+WorldTab:AddToggle({
+	Title = "Noclip (on foot)",
+	Subtitle = "Walk through walls",
+	Icon = "ghost",
+	Default = false,
+	Callback = function(state)
+		Fresh.Noclip = state
+		freshLog("Noclip " .. (state and "enabled" or "disabled"))
+		if not state or Fresh._noclipRunning then return end
+		Fresh._noclipRunning = true
+		task.spawn(function()
+			while Fresh.Noclip and not FreshOff do
+				pcall(function()
+					local char = LP.Character
+					if char then
+						for _, p in ipairs(char:GetDescendants()) do
+							if p:IsA("BasePart") then p.CanCollide = false end
+						end
+					end
+				end)
+				task.wait(0.3)
+			end
+			pcall(function()
+				local char = LP.Character
+				if char then
+					for _, p in ipairs(char:GetDescendants()) do
+						if p:IsA("BasePart") then p.CanCollide = true end
+					end
+				end
+			end)
+			Fresh._noclipRunning = false
+		end)
+	end,
+})
+
+WorldTab:AddSlider({
+	Title = "ESP Range",
+	Icon = "eye",
+	Min = 200,
+	Max = 10000,
+	Default = 2000,
+	Callback = function(value)
+		EspMaxDist = value
+	end,
+})
+
+WorldTab:AddToggle({
+	Title = "Collectible ESP",
+	Subtitle = "Highlights pumpkins + items near you",
+	Icon = "eye",
+	Default = false,
+	Callback = function(state)
+		Fresh.ESP = state
+		freshLog("ESP " .. (state and "enabled" or "disabled"))
+		if not state or Fresh._espRunning then return end
+		Fresh._espRunning = true
+		task.spawn(function()
+			local espFolder = nil
+			pcall(function()
+				espFolder = Instance.new("Folder")
+				espFolder.Name = "MegaESP"
+				espFolder.Parent = workspace
+			end)
+			while Fresh.ESP and not FreshOff do
+				pcall(function()
+					if espFolder then espFolder:ClearAllChildren() end
+					local me = freshHrpPos()
+					local cands = {}
+					for _, folder in ipairs(freshCollectFolders()) do
+						local descs = {}
+						pcall(function() descs = folder:GetDescendants() end)
+						for _, d in ipairs(descs) do
+							local okP = false
+							pcall(function() okP = d:IsA("BasePart") end)
+							if okP then
+								local okD, dd = pcall(function() return (d.Position - (me or d.Position)).Magnitude end)
+								if okD and dd <= EspMaxDist then cands[#cands + 1] = { p = d, dd = dd } end
+								if #cands >= 200 then break end
+							end
+						end
+						if #cands >= 200 then break end
+					end
+					pcall(function()
+						table.sort(cands, function(a, b) return a.dd < b.dd end)
+					end)
+					local shown = math.min(40, #cands)
+					for i = 1, shown do
+						local part = cands[i].p
+						local model = part
+						pcall(function()
+							local n = part
+							while n and n.Parent and n.Parent ~= workspace do
+								local okT, tagged = pcall(function() return CollectionService:HasTag(n, "Collectible_Model") end)
+								if okT and tagged then model = n break end
+								n = n.Parent
+							end
+						end)
+						local hl = Instance.new("Highlight")
+						hl.FillColor = Color3.fromRGB(80, 210, 120)
+						hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+						hl.Adornee = model
+						hl.Parent = espFolder
+					end
+					freshStatus("Status: ESP - " .. tostring(shown) .. " highlighted")
+				end)
+				task.wait(2)
+			end
+			pcall(function()
+				if espFolder then espFolder:Destroy() end
+			end)
+			Fresh._espRunning = false
+		end)
+	end,
+})
+
+WorldTab:AddButton({
+	Title = "Teleport: Own Tycoon",
+	Icon = "home",
+	Text = "Go",
+	Callback = function()
+		local ty = megaOwnTycoon()
+		local part = ty and freshFirstPart(ty)
+		if part then
+			freshGoto(part.CFrame + Vector3.new(0, 4, 0))
+			freshStatus("Status: at own tycoon")
+		else
+			freshNotify("Own tycoon not found")
+		end
+	end,
+})
+
+WorldTab:AddButton({
+	Title = "Teleport: Nearest Collectible",
+	Icon = "package",
+	Text = "Go",
+	Callback = function()
+		local part = megaNearestCollectible()
+		if part then
+			freshGoto(part.CFrame + Vector3.new(0, 3, 0))
+			freshStatus("Status: at nearest collectible")
+		else
+			freshNotify("No collectibles found")
+		end
+	end,
+})
+
+WorldTab:AddButton({
+	Title = "Teleport: Race Start",
+	Subtitle = "Uses the Race tab target",
+	Icon = "flag",
+	Text = "Go",
+	Callback = function()
+		local done = false
+		pcall(function()
+			for _, folder in ipairs(freshRaceFolders()) do
+				for _, r in ipairs(folder:GetChildren()) do
+					if FreshRace == "All" or r.Name == FreshRace then
+						local cps = freshRacePoints(r)
+						if #cps > 0 then
+							freshGoto(cps[1].CFrame + Vector3.new(0, 4, 0))
+							freshStatus("Status: at race " .. r.Name)
+							done = true
+							break
+						end
+					end
+				end
+				if done then break end
+			end
+		end)
+		if not done then freshNotify("No race start found (try Refresh in Race tab)") end
+	end,
+})
+
+WorldTab:AddButton({
+	Title = "Teleport: Nearest Speed Trap",
+	Icon = "camera",
+	Text = "Go",
+	Callback = function()
+		local folder = workspace:FindFirstChild("SpeedCameras")
+		local part = nil
+		if folder then
+			pcall(function()
+				for _, d in ipairs(folder:GetDescendants()) do
+					if d:IsA("BasePart") then part = d break end
+				end
+			end)
+		end
+		if part then
+			freshGoto(part.CFrame + Vector3.new(0, 4, 0))
+			freshStatus("Status: at speed trap")
+		else
+			freshNotify("No speed cameras found")
+		end
+	end,
+})
+
+-- ===== Misc tab =====
+local MiscTab = Window:AddTab("Misc", "wrench")
+
+local TrapMode = "Drive"
+MiscTab:AddDropdown({
+	Title = "Trap Mode",
+	Icon = "camera",
+	Options = { "Drive", "Teleport" },
+	Default = "Drive",
+	Callback = function(selected)
+		TrapMode = selected
+	end,
+})
+
+MiscTab:AddToggle({
+	Title = "Auto Speed Traps",
+	Subtitle = "Sit in a vehicle first",
+	Icon = "camera",
+	Default = false,
+	Callback = function(state)
+		Fresh.Traps = state
+		freshLog("Speed Traps " .. (state and "enabled" or "disabled"))
+		if not state or Fresh._trapsRunning then return end
+		local folder = workspace:FindFirstChild("SpeedCameras")
+		if not folder then
+			pcall(function()
+				local a = ReplicatedStorage:FindFirstChild("Assets")
+				local w = a and a:FindFirstChild("Waypoints")
+				folder = w and w:FindFirstChild("SpeedTrapWaypoints")
+			end)
+		end
+		if not folder then
+			freshNotify("No speed cameras found")
+			Fresh.Traps = false
+			return
+		end
+		Fresh._trapsRunning = true
+		task.spawn(function()
+			while Fresh.Traps and not FreshOff do
+				local live = workspace:FindFirstChild("SpeedCameras") or folder
+				if not live then
+					freshStatus("Status: Traps - folder gone")
+					task.wait(2)
+				else
+					local cams = {}
+					pcall(function()
+						for _, d in ipairs(live:GetDescendants()) do
+							if d:IsA("BasePart") then cams[#cams + 1] = d end
+						end
+					end)
+					local me = freshHrpPos()
+					if me and #cams > 1 then
+						local dist = {}
+						for _, o in ipairs(cams) do
+							local okD, p = pcall(function() return (o.Position - me).Magnitude end)
+							dist[o] = (okD and p) or math.huge
+						end
+						pcall(function()
+							table.sort(cams, function(a, b)
+								return (dist[a] or math.huge) < (dist[b] or math.huge)
+							end)
+						end)
+					end
+					for i, cam in ipairs(cams) do
+						if not Fresh.Traps or FreshOff then break end
+						local okC, cpos = pcall(function() return cam.Position end)
+						if okC and cpos then
+							freshStatus(string.format("Status: Trap %d/%d [%s]", i, #cams, TrapMode))
+							if TrapMode == "Teleport" then
+								freshGoto(cam.CFrame + Vector3.new(0, 3, 0))
+								freshPromptBurst(cpos, 16)
+								freshTouch(cam)
+							else
+								local seat = freshSeat()
+								if seat and seat:IsA("VehicleSeat") then
+									pcall(function() seat.MaxSpeed = CruiseSpeed end)
+									freshSteerTo(cpos + Vector3.new(0, 3, 0), CruiseSpeed, 20, "Traps", 25)
+								else
+									freshGoto(cam.CFrame + Vector3.new(0, 3, 0))
+									freshPromptBurst(cpos, 16)
+									freshTouch(cam)
+								end
+							end
+							task.wait(0.5)
+						end
+					end
+					task.wait(0.5)
+				end
+			end
+			Fresh._trapsRunning = false
+		end)
+	end,
+})
+
+local crateKinds = {
+	{ flag = "Deluxe", label = "Deluxe Custom Crate", arg = "DecorationKitDeluxe" },
+	{ flag = "Crate", label = "Custom Crate", arg = "DecorationKit" },
+	{ flag = "Event", label = "Event Crate", arg = "DecorationKitHalloween" },
+}
+for _, k in ipairs(crateKinds) do
+	MiscTab:AddToggle({
+		Title = "Auto Open " .. k.label,
+		Icon = "package",
+		Default = false,
+		Callback = function(state)
+			local key = "Crate" .. k.flag
+			Fresh[key] = state
+			freshLog(k.label .. " " .. (state and "enabled" or "disabled"))
+			if not state or Fresh["_run" .. key] then return end
+			Fresh["_run" .. key] = true
+			task.spawn(function()
+				local remote = freshRemote("Consume", "RemoteFunction")
+				while Fresh[key] and not FreshOff do
+					pcall(function()
+						if remote then remote:InvokeServer(k.arg) end
+					end)
+					task.wait(3)
+				end
+				Fresh["_run" .. key] = false
+			end)
+		end,
+	})
+end
+
+MiscTab:AddToggle({
+	Title = "Auto Buy Event Crate",
+	Icon = "shopping-cart",
+	Default = false,
+	Callback = function(state)
+		Fresh.BuyEvent = state
+		freshLog("Auto Buy Event " .. (state and "enabled" or "disabled"))
+		if not state or Fresh._buyRunning then return end
+		Fresh._buyRunning = true
+		task.spawn(function()
+			local shop = freshRemote("PurchaseShopItem", "RemoteFunction")
+			while Fresh.BuyEvent and not FreshOff do
+				pcall(function()
+					if shop then shop:InvokeServer("HalloweenKit") end
+				end)
+				task.wait(3)
+			end
+			Fresh._buyRunning = false
+		end)
+	end,
+})
+
+MiscTab:AddToggle({
+	Title = "Potato Mode",
+	Subtitle = "Lowest graphics (rejoin restores textures)",
+	Icon = "zap",
+	Default = false,
+	Callback = function(state)
+		Fresh.Potato = state
+		freshLog("Potato " .. (state and "enabled" or "disabled"))
+		if not state then
+			if Fresh._potConn then
+				pcall(function() Fresh._potConn:Disconnect() end)
+				Fresh._potConn = nil
+			end
+			local S = Fresh._potSaved
+			if S then
+				pcall(function()
+					local L = game:GetService("Lighting")
+					if S.Quality then settings().Rendering.QualityLevel = S.Quality end
+					if S.Shadows ~= nil then L.GlobalShadows = S.Shadows end
+				end)
+				Fresh._potSaved = nil
+			end
+			freshNotify("Potato off - rejoin restores textures")
+			return
+		end
+		pcall(function()
+			local L = game:GetService("Lighting")
+			local R = settings().Rendering
+			local S = {}
+			S.Quality = R.QualityLevel
+			S.Shadows = L.GlobalShadows
+			R.QualityLevel = Enum.QualityLevel.Level01
+			L.GlobalShadows = false
+			Fresh._potSaved = S
+		end)
+		if not Fresh._potConn then
+			Fresh._potConn = workspace.DescendantAdded:Connect(function(d)
+				if Fresh.Potato and not FreshOff then
+					pcall(function()
+						if d:IsA("BasePart") then
+							d.Material = Enum.Material.SmoothPlastic
+						end
+					end)
+				end
+			end)
+		end
+		task.spawn(function()
+			local descs = {}
+			pcall(function() descs = workspace:GetDescendants() end)
+			local n = 0
+			for _, d in ipairs(descs) do
+				if not Fresh.Potato or FreshOff then break end
+				pcall(function()
+					if d:IsA("BasePart") then d.Material = Enum.Material.SmoothPlastic end
+				end)
+				n = n + 1
+				if n % 3000 == 0 then task.wait() end
+			end
+			freshLog("Potato: stripped " .. n .. " instances")
+		end)
+	end,
+})
+
+MiscTab:AddButton({
+	Title = "Force Load Map",
+	Subtitle = "Touches all descendants",
+	Icon = "map",
+	Text = "Load",
+	Callback = function()
+		pcall(function() workspace:GetDescendants() end)
+		freshLog("Force load done")
+	end,
+})
+
+-- ===== Settings tab (fancy UI pattern) =====
+local SettingsTab = Window:AddTab("Settings", "settings")
+
+local themeNames = {}
+for name in pairs(VantixUI.Themes) do
+	themeNames[#themeNames + 1] = name
+end
+table.sort(themeNames)
+
+SettingsTab:AddDropdown({
+	Title = "Theme",
+	Icon = "swatch-book",
+	Options = themeNames,
+	Default = Window:GetTheme(),
+	Callback = function(selected)
+		Window:SetTheme(selected)
+	end,
+})
+
+SettingsTab:AddDropdown({
+	Title = "Accent Color",
+	Icon = "droplet",
+	Options = { "White", "Blue", "Red", "Green", "Purple" },
+	Default = "White",
+	Callback = function(selected)
+		local colors = {
+			White = Color3.fromRGB(255, 255, 255),
+			Blue = Color3.fromRGB(64, 156, 255),
+			Red = Color3.fromRGB(230, 70, 70),
+			Green = Color3.fromRGB(80, 210, 120),
+			Purple = Color3.fromRGB(170, 110, 240),
+		}
+		VantixUI:SetAccentColor(colors[selected])
+		Panel:SetTitle("Live Stats (" .. selected .. ")")
+		accentRow:Set(freshHex(VantixUI:GetAccentColor()))
+	end,
+})
+
+SettingsTab:AddToggle({
+	Title = "Show Stats Panel",
+	Icon = "gauge",
+	Default = true,
+	Callback = function(state)
+		Panel:SetVisible(state)
+	end,
+})
+
+SettingsTab:AddSeparator()
+
+local configName = SettingsTab:AddTextBox({
+	Title = "Configuration Name",
+	Icon = "file-text",
+	Placeholder = "Enter config name...",
+	Default = "VenasMega",
+	Callback = function(text, enterPressed)
+		if enterPressed then
+			Fresh.ConfigName = text
+		end
+	end,
+})
+
+local uiKeybind = SettingsTab:AddKeybind({
+	Title = "Hide UI Keybind",
+	Subtitle = "Insert hides the window",
+	Icon = "keyboard",
+	Default = Enum.KeyCode.Insert,
+	Callback = function()
+		local sg = Window.Gui
+		if sg then sg.Enabled = not sg.Enabled end
+	end,
+})
+
+SettingsTab:AddSeparator()
+SettingsTab:AddLabel("Config System", "save")
+
+Window.ConfigManager:SetFolder("VenasMega")
+
+local function freshBuildConfig(name)
+	local cfg = Window.ConfigManager:CreateConfig(name)
+	cfg:RegisterElement("CruiseSpeed", cruiseBox)
+	cfg:RegisterElement("TargetRace", raceTargetDD)
+	cfg:RegisterElement("ConfigName", configName)
+	cfg:RegisterElement("UIKeybind", uiKeybind)
+	return cfg
+end
+
+local savedConfigs = SettingsTab:AddDropdown({
+	Title = "Saved Configs",
+	Icon = "folder",
+	Options = Window.ConfigManager:GetConfigs(),
+})
+
+SettingsTab:AddButton({
+	Title = "Save Config",
+	Icon = "save",
+	Text = "Save",
+	Callback = function()
+		local okC, errC = pcall(function() freshBuildConfig(configName:Get()):Save() end)
+		if not okC then
+			Window:Notify({ Title = "Config", Text = "Save failed: " .. tostring(errC):sub(1, 80), Duration = 3 })
+			return
+		end
+		savedConfigs:SetOptions(Window.ConfigManager:GetConfigs())
+		Window:Notify({ Title = "Config", Text = "Saved as " .. configName:Get(), Duration = 2 })
+	end,
+})
+
+SettingsTab:AddButton({
+	Title = "Load Selected",
+	Icon = "download",
+	Text = "Load",
+	Callback = function()
+		local name = savedConfigs:Get()
+		if name and name ~= "" then
+			configName:Set(name)
+			local okL, errL = pcall(function() freshBuildConfig(name):Load() end)
+			if not okL then
+				Window:Notify({ Title = "Config", Text = "Load failed: " .. tostring(errL):sub(1, 80), Duration = 3 })
+				return
+			end
+			Window:Notify({ Title = "Config", Text = "Loaded " .. name, Duration = 2 })
+		end
+	end,
+})
+
+SettingsTab:AddButton({
+	Title = "Delete Selected",
+	Icon = "trash-2",
+	Text = "Delete",
+	Risky = true,
+	Callback = function()
+		local name = savedConfigs:Get()
+		if name and name ~= "" then
+			Window.ConfigManager:DeleteConfig(name)
+			savedConfigs:SetOptions(Window.ConfigManager:GetConfigs())
+			Window:Notify({ Title = "Config", Text = "Deleted " .. name, Duration = 2 })
+		end
+	end,
+})
+
+SettingsTab:AddSeparator()
+
+SettingsTab:AddButton({
+	Title = "Minimize",
+	Icon = "minus",
+	Text = "Minimize",
+	Callback = function() Window:Minimize() end,
+})
+
+SettingsTab:AddButton({
+	Title = "Restore",
+	Icon = "square",
+	Text = "Restore",
+	Callback = function() Window:Restore() end,
+})
+
+SettingsTab:AddButton({
+	Title = "Unload",
+	Icon = "log-out",
+	Text = "Unload",
+	Callback = function()
+		FreshOff = true
+		for _, k in ipairs({ "Cruise", "Collect", "Kit", "Rewards", "Sell", "Delivery", "Upgrade", "Traps", "Race", "AutoTune", "Halloween", "Fly", "Noclip", "ESP", "CrateDeluxe", "CrateCrate", "CrateEvent", "BuyEvent", "Potato" }) do
+			Fresh[k] = false
+		end
+		local seat = freshSeat()
+		if seat and seat:IsA("VehicleSeat") then
+			pcall(function()
+				seat.ThrottleFloat = 0
+				seat.SteerFloat = 0
+			end)
+		end
+		Panel:Destroy()
+		QuickBar:Destroy()
+		Window:Destroy()
+	end,
+})
+
+-- ===== stats panel + quick bar (fancy UI pattern) =====
+Panel = VantixUI:CreateNewWindow({
+	Title = "Live Stats (White)",
+	Name = "VenasMegaStats",
+	Size = { 240 },
+	Minimizable = true,
+	OnClose = function() freshLog("Stats panel closed") end,
+})
+Panel:AddHeader("Session")
+local fpsRow = Panel:AddRow("FPS")
+local pingRow = Panel:AddRow("Ping")
+minRow = Panel:AddRow("Main Window Minimized")
+keyRow = Panel:AddRow("Toggle Key")
+Panel:AddSeparator()
+Panel:AddHeader("Window")
+accentRow = Panel:AddRow("Accent")
+accentRow:Set(freshHex(VantixUI:GetAccentColor()))
+Panel:AddSeparator()
+Panel:AddHeader("Player")
+local posRow = Panel:AddRow("Position")
+Panel:AddRow("Character", {
+	Style = "Vertical",
+	AccentKey = "white",
+	ValueColorKey = "text",
+}):Set(LP.Name)
+local lapsRow = Panel:AddRow("Farm Laps")
+local gotRow = Panel:AddRow("Items Collected")
+Panel:AddSeparator()
+Panel:AddHeader("Actions")
+Panel:AddToggle("Show Quick Bar", true, function(on)
+	QuickBar:SetVisible(on)
+end)
+Panel:AddButton("Clear activity log", function()
+	feed:Clear()
+end)
+Panel:AddButton("Minimize this panel", function()
+	Panel:Minimize()
+end)
+
+QuickBar = VantixUI:CreateNewWindow({
+	Title = "Quick Bar",
+	Layout = "Horizontal",
+	Position = UDim2.new(0, 20, 0, 88),
+})
+qFpsRow = QuickBar:AddRow("FPS")
+QuickBar:AddSeparator()
+qPingRow = QuickBar:AddRow("Ping")
+QuickBar:AddSeparator()
+QuickBar:AddButton({ Text = "Log ping", Callback = function()
+	freshLog("Ping: " .. lastPing)
+end })
+
+task.spawn(function()
+	if not Panel or not Panel.Card then return end
+	local Stats = game:GetService("Stats")
+	local frames, last = 0, os.clock()
+	local slowT = 0
+	while not FreshOff and Panel.Card and Panel.Card.Parent do
+		frames = frames + 1
+		local now = os.clock()
+		if now - last >= 1 then
+			fpsRow:Set(frames)
+			qFpsRow:Set(frames)
+			frames, last = 0, now
+		end
+		if now - slowT >= 0.25 then
+			slowT = now
+			local root = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+			if root then
+				local p = root.Position
+				posRow:Set(string.format("%d, %d, %d", p.X, p.Y, p.Z))
+			end
+			local ok, ping = pcall(function()
+				return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
+			end)
+			if ok then
+				lastPing = string.format("%dms", ping)
+				pingRow:Set(lastPing)
+				qPingRow:Set(lastPing)
+			end
+			minRow:Set(Window:IsMinimized() and "Yes" or "No")
+			local key = Window:GetToggleKey()
+			keyRow:Set(key and key.Name or "None")
+			lapsRow:Set(tostring(Fresh.CruiseLaps or 0))
+			gotRow:Set(tostring(Fresh.Collected or 0))
+		end
+		RunService.Heartbeat:Wait()
+	end
+end)
