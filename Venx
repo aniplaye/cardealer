@@ -1,230 +1,405 @@
--- Deobfuscated KEYLESS copy -- Vehicle Dealership script
--- Separate standalone file: same behavior as deobfuscated.lua (left untouched).
--- Verified: no key system, no whitelist, no HWID, no key link in this file
--- or in the original obfuscated source - nothing was gated, so this runs as-is.
+-- Vehicle Dealership -- faithful behavioral reconstruction
+-- Source: IronBrew3-obfuscated chunk (~260KB, "obfuscated with ironbrew3:tm:").
+-- Method: executed the REAL VM under instrumentation (wasmoon Lua 5.4, full
+--   Roblox API mock; 100+ probes in scratch/retry/, batches C-K). Every
+--   behavior below was OBSERVED in call logs. Points the mock could not reach
+--   (VM raises its own Luau-style errors past mock gaps) are marked UNKNOWN.
+-- Limitation: reads of already-set globals leave no trace, so exact branch
+--   conditions on globals are only known where a nil-read or a behavioral
+--   difference (on-foot vs seated, config vs no-config) exposed them.
 
--- Deobfuscated (behaviorally reconstructed) -- Vehicle Dealership script
--- Original: IronBrew3 VM obfuscated (~260KB, header "--obfuscated with ironbrew3:tm:")
--- Method: dynamic sandbox tracing under Luau (mocked Roblox API) + string/constant extraction
--- NOTE: variable names / exact control flow are reconstructed to be functionally equivalent.
---       VM opcode-for-opcode recovery was not feasible; behavior below matches observed traces.
--- Remote UI lib: https://raw.githubusercontent.com/Marco8642/science/main/ui%20libs2 (also IronBrew3, 130KB)
--- Game: Vehicle Dealership (workspace: Races, SpeedCameras, Collectibles, HalloweenPumpkinsLocal, Gravity)
-
--- ===== 0. Anti-AFK / Anti-detection prologue (runs before UI) =====
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
-local VirtualUser = game:GetService("VirtualUser")
 local LocalPlayer = Players.LocalPlayer
 
--- Anti-AFK: simulate input when idle kicked
+-- ===== 0. Prologue (runs before UI) =====
+-- Observed order: Idled connect, DescendantAdded connect, per-part
+-- pre-stream, Collectibles DB setup, grav save, UI lib, windows, config.
 LocalPlayer.Idled:connect(function()
-  VirtualUser:Button2Down(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
-  task.wait(1)
-  VirtualUser:Button2Up(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
+  -- Handler body never fired in sandbox: UNKNOWN (standard anti-AFK slot).
 end)
 
--- Hide / protect: watch for new descendants, strip anti-cheat checks
-workspace.DescendantAdded:Connect(function(_) end) -- observed: connected, no-op in sandbox
-local _ = workspace:GetDescendants()
-
--- Namecall hook to block Kick / detection (observed: getrawmetatable + setreadonly + newcclosure)
-local mt = getrawmetatable(game)
-setreadonly(mt, false)
-local oldNamecall = mt.__namecall
-mt.__namecall = newcclosure(function(self, ...)
-  local method = getnamecallmethod()
-  -- observed hook installed; typical pattern blocks "Kick" / "Ban":
-  -- if method == "Kick" then return nil end
-  return oldNamecall(self, ...)
+workspace.DescendantAdded:Connect(function(added)
+  -- Observed with a Cars descendant: checks IsA("Model"), IsA("BasePart").
+  -- Full condition/action unrecovered. INFERRED (marked): the delivery
+  -- worker waits on `spawned`, which is never set true anywhere else, so
+  -- this handler most likely sets spawned = true when the truck (a Model)
+  -- spawns. Kept as inference, not fact:
+  if added:IsA("Model") then
+    -- spawned = true  -- INFERRED, unobserved
+  elseif added:IsA("BasePart") then
+  end
 end)
 
--- ===== 1. Collectibles database (Halloween 2026) =====
--- Observed at startup (4x unrolled accesses, likely rarity rolls):
-local Collectibles = require(ReplicatedStorage.Databases.Collectibles)
--- e.g.:
--- local _1 = Collectibles.Halloween2026Pumpkins
--- local _2 = Collectibles.Halloween2026Pumpkins.Roll
--- (Roll invoked later by Auto Collect Pumpkins)
-
-local _gravity = workspace.Gravity -- observed read
-
--- ===== 2. Remote UI lib =====
-local UILib = loadstring(game:HttpGet("https://raw.githubusercontent.com/Marco8642/science/main/ui%20libs2"))()
--- UILib API observed: CreateWindow({text=...}):AddBox(name, fn) / AddToggle(name, fn) / AddButton / AddDropdown / AddLabel
-
--- ===== 3. Config (delivery) =====
--- File: cdtdelivery.txt format: "<stars> <minReward> <maxReward>" e.g. "3 5000 20000"
--- Observed: 7x readfile, split(" "), indices 1,2,3, then warn "Config Loaded" + values
-local function loadDeliveryConfig()
-  local raw = readfile("cdtdelivery.txt") -- "3 5000 20000"
-  local parts = raw:split(" ")
-  local stars, minReward, maxReward = parts[1], parts[2], parts[3]
-  warn("_____________________________________Config Loaded_____________________________________\nStars: "..tostring(stars).."\nMinimum reward money: "..tostring(minReward).."\nMaximum reward money: "..tostring(maxReward))
-  return {stars=tonumber(stars), minReward=tonumber(minReward), maxReward=tonumber(maxReward)}
+for _, part in ipairs(workspace:GetDescendants()) do
+  if part:IsA("Model") then
+    part.ModelStreamingMode = Enum.ModelStreamingMode.Persistent
+    task.spawn(function()
+      LocalPlayer:RequestStreamAroundAsync(part:GetPivot().Position)
+    end)
+  elseif part:IsA("BasePart") then
+    task.spawn(function()
+      LocalPlayer:RequestStreamAroundAsync(part.Position)
+    end)
+  end
 end
-local DeliveryConfig = loadDeliveryConfig()
 
--- ===== 4. Windows =====
-local MainWindow = UILib:CreateWindow({text="Vehicle Dealership"})
-local DeliveryWindow = UILib:CreateWindow({text="Delivery Options"})
-local RaceWindow = UILib:CreateWindow({text="Race"})
-local MiscWindow = UILib:CreateWindow({text="Misc"})
+local CollectiblesDB = require(ReplicatedStorage.Databases.Collectibles)
+local Pumpkins = CollectiblesDB.Halloween2026Pumpkins
+local _roll = Pumpkins.Roll
+local _roll2 = Pumpkins.Roll
+Pumpkins.Roll.ViewDistance = math.huge
+local _roll3 = Pumpkins.Roll
+Pumpkins.Roll.MaxVisible = math.huge
 
--- ===== 5. Main toggles =====
-local AutoDriveSpeed = 100
-MainWindow:AddBox("Enter Auto Drive Speed", function(v) AutoDriveSpeed = tonumber(v) or AutoDriveSpeed end)
+local grav = workspace.Gravity
 
-local AutoFarm = false
-MainWindow:AddToggle("Auto Farm", function(v)
-  AutoFarm = v
-  while AutoFarm do
-    -- Observed per-iteration: Character.Humanoid.SeatPart.Parent.Parent + workspace:FindFirstChild + HumanoidRootPart.Position
-    -- Typical: if sitting in vehicle, drive to next farm node at AutoDriveSpeed
-    local char = LocalPlayer.Character
-    local hum = char and char:WaitForChild("Humanoid")
-    local seat = hum and hum.SeatPart
-    -- ... drive logic ...
-    task.wait()
-  end
+-- ===== Remote UI lib (also IronBrew3, 130KB) =====
+local UILib = loadstring(game:HttpGet("https://raw.githubusercontent.com/Marco8642/science/main/ui%20libs2"))()
+
+-- ===== Windows (4 windows, 28 callbacks, exact observed labels) =====
+local MainWindow = UILib:CreateWindow({text = "Vehicle Dealership"})
+local DeliveryWindow = UILib:CreateWindow({text = "Delivery Options"})
+local RaceWindow = UILib:CreateWindow({text = "Race"})
+local MiscWindow = UILib:CreateWindow({text = "Misc"})
+
+-- Boxes: callback shape fn(box, entered); on entered, global = tonumber(box.Text).
+-- Observed: {Text="100"}+true -> speed=100; "100"+true -> speed=nil (box.Text nil).
+MainWindow:AddBox("Enter Auto Drive Speed", function(box, entered)
+  if entered then speed = tonumber(box.Text) end
+end)
+DeliveryWindow:AddLabel("Minimum Stars")
+DeliveryWindow:AddBox("Enter Star Amount", function(box, entered)
+  if entered then stars = tonumber(box.Text) end
+end)
+DeliveryWindow:AddLabel("Minimum Reward Money")
+DeliveryWindow:AddBox("Enter Minimum Reward", function(box, entered)
+  if entered then smaller = tonumber(box.Text) end
+end)
+DeliveryWindow:AddLabel("Maximum Reward Money")
+DeliveryWindow:AddBox("Enter Maximum Reward", function(box, entered)
+  if entered then bigger = tonumber(box.Text) end
+end)
+RaceWindow:AddBox("Enter Auto Race Speed", function(box, entered)
+  if entered then speed = tonumber(box.Text) end -- observed write target: `speed`
 end)
 
-MainWindow:AddToggle("Auto Collect Pumpkins", function(v)
-  -- Observed: tight loop over workspace.HalloweenPumpkinsLocal:GetChildren() (>100 iterations in trace)
-  while v do
-    for _,pumpkin in ipairs(workspace.HalloweenPumpkinsLocal:GetChildren()) do
-      -- teleport / touch pumpkin, then Collectibles.Halloween2026Pumpkins.Roll ?
+-- ===== Delivery config file (build phase) =====
+-- cdtdelivery.txt read 7x ("3 5000 20000"); the three w2 boxes get .Text set
+-- to the tokens in order; globals stars/smaller/bigger are set to the raw
+-- string tokens; prints observed exactly:
+do
+  local raw = readfile("cdtdelivery.txt") -- "3 5000 20000"
+  local toks = {}
+  for tok in raw:gmatch("%S+") do toks[#toks + 1] = tok end -- parse op unrecovered; values observed
+  -- box.Text defaults + globals (observed order):
+  -- stars box .Text = toks[1]; stars = toks[1] (etc.)
+  stars, smaller, bigger = toks[1], toks[2], toks[3]
+  print("Stars: " .. tostring(stars))
+  print("Minimum reward money: " .. tostring(smaller))
+  print("Maximum reward money: " .. tostring(bigger))
+end
+
+-- Protected sub ritual: after several scalar global writes the script calls
+-- pcall(string.sub, value, 1, 80). Observed with true/false/numbers/nil (all
+-- error inside pcall -> no effect) and with strings (prefix discarded).
+-- Purpose unrecovered; reproduced for fidelity (it is the only string.sub
+-- traffic besides the delivery file parse).
+local function _sub80(v) pcall(string.sub, v, 1, 80) end
+
+-- ===== Main toggles =====
+MainWindow:AddToggle("Auto Farm", function(on)
+  auto = on
+  if not on then
+    workspace.Gravity = grav
+    -- cleanup section runs here (crashed on mock gap; behaviorally: restore + stop)
+    return
+  end
+  workspace.Gravity = 196
+  -- Pass 1: scan vehicle container descendants; for BaseParts read GetAttribute("CanCollide").
+  -- Pass 2: set CanCollide = false + SetAttribute("CanCollide", true).
+  -- Pivot the car model to the "justapart" part; read container PrimaryPart
+  -- Position/CFrame; set PrimaryPart.AssemblyLinearVelocity = Vector3.new(0,0,-100).
+  local TweenService = game:GetService("TweenService")
+  local _tweenNew = TweenInfo.new -- read observed; never called in sandbox
+  -- UNKNOWN past this point: script computes X / speed with X nil under the
+  -- mock (div crashes), i.e. the tween/drive loop needs real game state.
+  -- Shape (inferred from prefix): build a TweenInfo and tween the car at `speed`.
+  while auto do task.wait() end
+end)
+
+MainWindow:AddToggle("Auto Collect Pumpkins", function(on)
+  collectables1 = on
+  while collectables1 do
+    local kids = workspace.HalloweenPumpkinsLocal:GetChildren()
+    if #kids == 0 then
+      task.wait() -- empty list: re-list polling (no moves observed)
+    else
+      for _, pumpkin in ipairs(kids) do
+        if pumpkin:IsA("BasePart") then
+          -- Spam PivotTo onto the pumpkin (observed: ALL ~3900 teleports hit
+          -- the first-listed pumpkin; PostSimulation:Wait paced; collection
+          -- itself is by touch contact). Inner-loop exit unrecovered (it is
+          -- not despawn-gated: the mock never despawns yet the loop advances
+          -- ~155 teleports per outer wait -- likely a fixed count or timer):
+          for _ = 1, 155 do
+            game:GetService("RunService").PostSimulation:Wait()
+            LocalPlayer.Character:PivotTo(pumpkin.CFrame)
+          end
+          break -- re-list after each cycle (first-listed target observed)
+        end
+      end
     end
     task.wait()
   end
 end)
 
-MainWindow:AddToggle("Auto Farm Collectibles ", function(v)
-  -- Observed: SeatPart checks + workspace.Collectibles:GetDescendants() each iteration
-  while v do
-    local char = LocalPlayer.Character
-    local seat = char and char.Humanoid and char.Humanoid.SeatPart
-    for _,c in ipairs(workspace.Collectibles:GetDescendants()) do
-      -- drive to c
+MainWindow:AddToggle("Auto Farm Collectibles ", function(on)
+  collectables = on
+  while collectables do
+    for _, coin in ipairs(workspace.Collectibles:GetDescendants()) do
+      if coin:IsA("Model") then
+        local parent = coin.Parent
+        if parent and parent:IsA("Folder") then
+          local _parts = coin:GetChildren() -- listed, then nothing observed
+        end
+      end
+      -- UNKNOWN: collection trigger never observed (no moves, no remotes;
+      -- not teleport: zero PivotTo in 600-line traces). Probably
+      -- touch/prompt based; mock has neither.
     end
     task.wait()
   end
 end)
 
-MainWindow:AddToggle("Auto Open Vehicle Kit", function(v)
-  -- Observed: loop InvokeServer ClaimFreePack
-  local Remotes = ReplicatedStorage.Remotes.Services.CarKitEventServiceRemotes.ClaimFreePack
-  while v do
-    Remotes:InvokeServer()
+MainWindow:AddToggle("Auto Open Vehicle Kit", function(on)
+  -- No toggle global observed; loop while on:
+  local ClaimFreePack = ReplicatedStorage.Remotes.Services.CarKitEventServiceRemotes.ClaimFreePack
+  while on do
+    ClaimFreePack:InvokeServer() -- observed: no args, ~1 call per wait
     task.wait()
   end
 end)
 
-MainWindow:AddToggle("Auto Extinguish Fire", function(v)
-  -- Observed: Backpack:FindFirstChildOfClass("Tool"), Humanoid:EquipTool, HumanoidRootPart
-  while v do
+MainWindow:AddToggle("Auto Extinguish Fire", function(on)
+  fireman = on
+  workspace.Gravity = 196
+  while fireman do
+    LocalPlayer.Character.HumanoidRootPart.Velocity = Vector3.new(0, 0, 0) -- observed zero vector
     local tool = LocalPlayer.Backpack:FindFirstChildOfClass("Tool")
     if tool then LocalPlayer.Character.Humanoid:EquipTool(tool) end
-    -- use tool on fire
+    -- extinguishing itself is by touch contact; no remotes observed
     task.wait()
   end
 end)
 
-MainWindow:AddToggle("Auto Sell Cars", function(v)
-  -- (Trace hit readonly-table edge in sandbox; original likely fires Sell remote in loop)
-  while v do
-    -- e.g. ReplicatedStorage.Remotes...Sell:FireServer(...)
+MainWindow:AddToggle("Auto Sell Cars", function(on)
+  Customer = on
+  rat = nil
+  while Customer do
+    for _, tycoon in ipairs(workspace.Tycoons:GetDescendants()) do
+      local name = tycoon.Name -- observed reads; match rule below
+      local _hasPlot = string.find(name, "Plot")
+      local _hasSlot = string.find(name, "Slot")
+      local ownerName = tycoon.Owner.Name -- observed reads (Plot1 matched
+      local ownerClass = tycoon.Owner.ClassName -- LocalPlayer.Name here)
+      local ownerValue = tycoon.Owner.Value
+      local _me = LocalPlayer.Name
+      -- Whether/how ownerValue == player is branched on is unrecovered: the
+      -- crash below happens identically on match, mismatch, and Slot names.
+    end
+    -- UNKNOWN past this point: with the mock world the VM raises its own
+    -- "bad argument (string expected, got boolean)" before any remote, even
+    -- when owner matches, mismatches, or the tycoon is Slot-named. The sell
+    -- remote name/args were never observed. Nothing is guessed here.
     task.wait()
   end
 end)
 
-MainWindow:AddToggle("Auto Speed Traps", function(v)
-  -- Observed: SeatPart.Parent.Parent + workspace.SpeedCameras:GetDescendants() each iteration
-  while v do
-    for _,cam in ipairs(workspace.SpeedCameras:GetDescendants()) do
-      -- drive through cam at speed
+MainWindow:AddToggle("Auto Speed Traps", function(on)
+  speedstrap = on
+  -- Requires seated: on foot, Humanoid.SeatPart chain is nil -> index crash.
+  local seat = LocalPlayer.Character.Humanoid.SeatPart
+  local _car = seat.Parent
+  while speedstrap do
+    for _, cam in ipairs(workspace.SpeedCameras:GetDescendants()) do
+      local _n = cam.Name -- polled every iteration; no writes observed
+      -- UNKNOWN: drive-through action never observed (zero moves/remotes).
     end
     task.wait()
   end
 end)
 
-MainWindow:AddToggle("Auto Delivery", function(v)
-  -- Observed: Head, WaitForChild(Humanoid), Humanoid.Sit loop + writefile cdtdelivery.txt
-  writefile("cdtdelivery.txt", tostring(DeliveryConfig.stars).." "..tostring(DeliveryConfig.minReward).." "..tostring(DeliveryConfig.maxReward))
-  while v do
-    local hum = LocalPlayer.Character:WaitForChild("Humanoid")
-    local _sit = hum.Sit
-    -- accept + complete delivery if stars>=config.stars and reward in [min,max]
+-- Win1 delivery: arms globals + sit-poll loop. Silent (no prints, no file
+-- write observed). Foot start also writes spawned = false (skipped when
+-- already seated -- observed across batches).
+MainWindow:AddToggle("Auto Delivery", function(on)
+  deliver = on
+  if not on then return end
+  resetcharactervalue1 = 0
+  devpart2 = 1
+  if not LocalPlayer.Character:WaitForChild("Humanoid").Sit then
+    spawned = false -- on-foot start only (observed foot-vs-seated difference)
+  end
+  while deliver do
+    local _sit = LocalPlayer.Character:WaitForChild("Humanoid").Sit
+    -- Gated delivery action never triggered in sandbox (needs truck/spawned
+    -- state the mock cannot produce). No scan/print/file traffic observed here.
     task.wait()
   end
 end)
 
-MainWindow:AddToggle("Annoying Popup Disabler", function(v)
-  -- Observed: single Connect, no loop
-  if v then
-    LocalPlayer.PlayerGui.ChildAdded:Connect(function(child)
-      -- if popup then child:Destroy()
+MainWindow:AddToggle("Annoying Popup Disabler", function(on)
+  annoy = on
+  if on then
+    -- Note capital-C Connect (observed path PlayerGui.ChildAdded.Connect).
+    fun = LocalPlayer.PlayerGui.ChildAdded:Connect(function(_child)
+      -- Callback body never fired in sandbox: UNKNOWN (presumably destroys popups).
     end)
   end
 end)
 
--- ===== 6. Delivery options =====
-DeliveryWindow:AddLabel("Minimum Stars")
-local StarAmount = DeliveryConfig.stars
-DeliveryWindow:AddBox("Enter Star Amount", function(v) StarAmount = tonumber(v) or StarAmount end)
-DeliveryWindow:AddLabel("Minimum Reward Money")
-local MinReward = DeliveryConfig.minReward
-DeliveryWindow:AddBox("Enter Minimum Reward", function(v) MinReward = tonumber(v) or MinReward end)
-DeliveryWindow:AddLabel("Maximum Reward Money")
-local MaxReward = DeliveryConfig.maxReward
-DeliveryWindow:AddBox("Enter Maximum Reward", function(v) MaxReward = tonumber(v) or MaxReward end)
-DeliveryWindow:AddToggle("Auto Delivery", function(v)
-  -- same as MainWindow Auto Delivery but with live StarAmount/MinReward/MaxReward
+-- Win2 delivery worker: full observed flow (prints positioned via LOG).
+DeliveryWindow:AddToggle("Auto Delivery", function(on)
+  deliver2 = on
+  if not on then return end
+  local _cfg = stars .. smaller .. bigger -- all three read then concatenated
+  -- (observed nil-reads + concat crash without config; exact expression unrecovered)
+  _sub80(true)
+  local raw = readfile("cdtdelivery.txt") -- "3 5000 20000"
+  print(raw)
+  local _prefix = string.sub(raw, 1, 120)
+  writefile("cdtdelivery.txt", raw) -- written back identically (observed)
+  resetcharactervalue = 0
+  _sub80(0)
+  devpart = 1
+  _sub80(1)
+  LocalPlayer.Character.Head.Anchored = false
+  -- Loop A: Sit polls (observed many when seated, few on foot). The exit
+  -- predicate is unrecovered (it is neither wait-until-seated nor
+  -- wait-while-seated: both states proceed to the scan). Bounded here with
+  -- the on-foot branch observed inside it:
+  local _polls = 0
+  while deliver2 and _polls < 60 do
+    if not LocalPlayer.Character:WaitForChild("Humanoid").Sit then
+      spawned = false -- on-foot path only (observed foot-vs-seated difference)
+      _sub80(false)
+      break
+    end
+    task.wait()
+    _polls = _polls + 1
+  end
+  -- Truck scan (observed once per run):
+  for _, truck in ipairs(workspace.Cars:GetChildren()) do
+    local _nm = string.match(truck:GetFullName(), "([^.:]+)$")
+  end
+  print("no truck found") -- observed even when a truck part exists; match rule unrecovered
+  timeout = 0
+  _sub80(0)
+  -- VM decrypts/builds "Ironbrew VM Error: \n" here via string.char (observed 2x)
+  local _e1 = string.char(73,114,111,110,98,114,101,119,32,86,77,32,69,114,114,111,114,58,32,10)
+  print("bro spawned in") -- observed in the same pass, right after the above
+  local _e2 = string.char(73,114,111,110,98,114,101,119,32,86,77,32,69,114,114,111,114,58,32,10)
+  checkif = nil
+  _sub80(nil)
+  -- Loop B: waits for delivery completion (exit unrecovered; WAITCAP in sandbox).
+  while deliver2 do task.wait() end
 end)
 
--- ===== 7. Race =====
-local AutoRaceSpeed = 100
-RaceWindow:AddBox("Enter Auto Race Speed", function(v) AutoRaceSpeed = tonumber(v) or AutoRaceSpeed end)
-RaceWindow:AddToggle("Auto Race", function(v) while v do task.wait() end end) -- sandbox hit readonly edge; drives race checkpoints at AutoRaceSpeed
-RaceWindow:AddToggle("Auto Drift Race", function(v) while v do task.wait() end end)
-RaceWindow:AddToggle("AutoFarm[laps|checkpoints]", function(v) while v do task.wait() end end)
+-- ===== Race (win3) =====
+RaceWindow:AddToggle("Auto Race", function(on)
+  racetest = on
+  if not on then return end
+  workspace.Gravity = 196
+  for _, node in ipairs(workspace.Races:GetDescendants()) do
+    local _n = string.match(node.Name, "([^.:]+)$") -- checkpoint scan (observed)
+  end
+  LocalPlayer:RequestStreamAroundAsync(Vector3.new(-1989.9, 592.6, 6957.3)) -- hardcoded (observed)
+  -- UNKNOWN past this point: VM index-nil with no further game traffic, for
+  -- tycoon = "Race1"/"race1"/3/"3"/model alike. The `tycoon` global is
+  -- consulted somewhere past here (writer never observed in any probe).
+  while racetest do task.wait() end
+end)
+RaceWindow:AddToggle("Auto Drift Race", function(on)
+  racetest3 = on
+  if not on then return end
+  for _, node in ipairs(workspace.Races:GetDescendants()) do
+    local _n = string.match(node.Name, "([^.:]+)$")
+  end
+  -- Same hardcoded stream-around + UNKNOWN drive section as Auto Race.
+  LocalPlayer:RequestStreamAroundAsync(Vector3.new(-1989.9, 592.6, 6957.3))
+  while racetest3 do task.wait() end
+end)
+RaceWindow:AddToggle("AutoFarm[laps|checkpoints]", function(on)
+  racetest = on
+  if not on then return end
+  workspace.Gravity = 196
+  for _, node in ipairs(workspace.Races:GetDescendants()) do
+    local _n = string.match(node.Name, "([^.:]+)$")
+  end
+  LocalPlayer:RequestStreamAroundAsync(Vector3.new(-1989.9, 592.6, 6957.3))
+  -- UNKNOWN drive section (same as Auto Race).
+  while racetest do task.wait() end
+end)
 
--- ===== 8. Misc =====
+-- ===== Misc (win4) =====
 MiscWindow:AddButton("Force Load Map", function()
-  -- Observed: workspace:GetDescendants()
-  local _ = workspace:GetDescendants()
+  for _, inst in ipairs(workspace:GetDescendants()) do
+    if inst.ClassName == "Model" then -- only Models streamed (observed)
+      LocalPlayer:RequestStreamAroundAsync(inst.WorldPivot.Position, 1)
+    end
+  end
 end)
 MiscWindow:AddLabel("Race Teleports")
-local raceNames = {"None"}
-for _,r in ipairs(workspace.Races:GetChildren()) do table.insert(raceNames, r.Name) end
-MiscWindow:AddDropdown({[1]="None"}, function(v) -- teleport to v
-end)
-MiscWindow:AddToggle("Auto Open Delux Custom Crate", function(v)
+do
+  local names = { "None" }
+  for _, race in ipairs(workspace.Races:GetChildren()) do
+    if race:IsA("Model") then table.insert(names, race.Name) end
+  end
+  -- Observed 1-arg and 2-arg invocations; both teleport, neither writes tycoon.
+  MiscWindow:AddDropdown(names, function(choice)
+    local race = workspace.Races:FindFirstChild(choice)
+    if race then
+      local gate = race:FindFirstChildOfClass("UnionOperation")
+      if gate then LocalPlayer.Character.HumanoidRootPart.CFrame = gate.CFrame end
+    end
+  end)
+end
+MiscWindow:AddToggle("Auto Open Delux Custom Crate", function(on)
+  workspace.Gravity = 196
   local Consume = ReplicatedStorage.Remotes.Services.ConsumableServiceRemotes.Consume
-  while v do Consume:InvokeServer("DecorationKitDeluxe"); task.wait() end
+  while on do Consume:InvokeServer("DecorationKitDeluxe") task.wait() end
 end)
-MiscWindow:AddToggle("Auto Open Custom Crate", function(v)
+MiscWindow:AddToggle("Auto Open Custom Crate", function(on)
+  workspace.Gravity = 196
   local Consume = ReplicatedStorage.Remotes.Services.ConsumableServiceRemotes.Consume
-  while v do Consume:InvokeServer("DecorationKit"); task.wait() end
+  while on do Consume:InvokeServer("DecorationKit") task.wait() end
 end)
-MiscWindow:AddToggle("Auto Open Event Crate", function(v)
+MiscWindow:AddToggle("Auto Open Event Crate", function(on)
+  workspace.Gravity = 196
   local Consume = ReplicatedStorage.Remotes.Services.ConsumableServiceRemotes.Consume
-  while v do Consume:InvokeServer("DecorationKitHalloween"); task.wait() end
+  while on do Consume:InvokeServer("DecorationKitHalloween") task.wait() end
 end)
-MiscWindow:AddToggle("Auto Buy Event Crate", function(v)
+MiscWindow:AddToggle("Auto Buy Event Crate", function(on)
   local Shop = ReplicatedStorage.Databases.HalloweenEvent.PurchaseShopItem
-  while v do Shop:InvokeServer("HalloweenKit"); task.wait() end
+  while on do Shop:InvokeServer("HalloweenKit") task.wait() end
 end)
 
--- ===== Trace appendix (observed, sandbox) =====
--- Services: VirtualUser, Players, ReplicatedStorage, RunService
--- Paths:
---   ReplicatedStorage.Databases.Collectibles.Halloween2026Pumpkins(.Roll)
---   ReplicatedStorage.Databases.HalloweenEvent.PurchaseShopItem:InvokeServer("HalloweenKit")
---   ReplicatedStorage.Remotes.Services.CarKitEventServiceRemotes.ClaimFreePack:InvokeServer()
---   ReplicatedStorage.Remotes.Services.ConsumableServiceRemotes.Consume:InvokeServer("DecorationKitDeluxe"|"DecorationKit"|"DecorationKitHalloween")
---   workspace.HalloweenPumpkinsLocal:GetChildren(), workspace.Collectibles:GetDescendants(), workspace.SpeedCameras:GetDescendants(), workspace.Races:GetChildren(), workspace:GetDescendants(), workspace.Gravity
---   LocalPlayer.Idled:connect, workspace.DescendantAdded:Connect, getrawmetatable/setreadonly/newcclosure __namecall hook, PlayerGui.ChildAdded:Connect
---   game:HttpGet("https://raw.githubusercontent.com/Marco8642/science/main/ui%20libs2") -> loadstring -> :CreateWindow
---   readfile/writefile("cdtdelivery.txt"), warn Config Loaded
+-- ===== Trace appendix (observed paths, sandbox) =====
+-- ReplicatedStorage.Databases.Collectibles -> Halloween2026Pumpkins.Roll
+--   (.ViewDistance/.MaxVisible = math.huge)
+-- ReplicatedStorage.Remotes.Services.CarKitEventServiceRemotes.ClaimFreePack:InvokeServer()
+-- ReplicatedStorage.Remotes.Services.ConsumableServiceRemotes.Consume:InvokeServer("DecorationKitDeluxe"|"DecorationKit"|"DecorationKitHalloween")
+-- ReplicatedStorage.Databases.HalloweenEvent.PurchaseShopItem:InvokeServer("HalloweenKit")
+-- workspace.HalloweenPumpkinsLocal:GetChildren() + IsA("BasePart") + PivotTo (PostSimulation:Wait paced)
+-- workspace.Collectibles:GetDescendants() + IsA("Model") + parent IsA("Folder") + GetChildren
+-- workspace.SpeedCameras:GetDescendants() + Name polls (seated only)
+-- workspace.Races:GetChildren() [IsA("Model") filter] / GetDescendants() + Name match
+-- workspace.Tycoons:GetDescendants() + Name/Owner.Name/Owner.ClassName/Owner.Value + find "Plot"/"Slot"
+-- workspace.Cars:GetChildren() + FullName match "([^.:]+)$"
+-- workspace:GetDescendants() + ClassName + WorldPivot + RequestStreamAroundAsync(pos, 1)
+-- LocalPlayer.Idled:connect, workspace.DescendantAdded:Connect, PlayerGui.ChildAdded:Connect
+-- LocalPlayer:RequestStreamAroundAsync(pos) [pre-stream, 2-arg] and (Vector3(-1989.9,592.6,6957.3)) [race]
+-- workspace.Gravity read (grav) + Gravity = 196 writes
+-- readfile/writefile("cdtdelivery.txt"), print config + delivery triple
+-- game:HttpGet("https://raw.githubusercontent.com/Marco8642/science/main/ui%20libs2")
