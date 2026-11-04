@@ -58,7 +58,7 @@ end)
 local Window -- forward decl so helpers can notify
 local function freshNotify(text)
 	pcall(function()
-		Window:Notify({ Title = "Vena Fresh", Text = text, Duration = 3 })
+		Window:Notify({ Title = "Vena Mega", Text = text, Duration = 3 })
 	end)
 end
 
@@ -359,7 +359,17 @@ Window:CreateTag("Mega", Color3.fromRGB(80, 210, 120), nil, "rocket")
 Window:CreateTag("V2.0", Color3.fromRGB(60, 120, 210), nil, "git-branch")
 Window:CreateTag("Keyless", Color3.fromRGB(255, 180, 50), nil, "key")
 
-Window:Notify({ Title = "Vena Fresh", Text = "Loaded", Icon = "check", Duration = 4 })
+Window:Notify({ Title = "Vena Mega", Text = "Loaded", Icon = "check", Duration = 4 })
+
+-- Hexagon loader behavior, ported: platform-aware greeting (TouchEnabled -> mobile/pc)
+pcall(function()
+	local platform = "pc"
+	pcall(function()
+		if UIS.TouchEnabled and not UIS.KeyboardEnabled then platform = "mobile" end
+	end)
+	Window:Notify({ Title = "Vena Mega", Text = "Welcome, " .. LP.Name .. " (" .. platform .. ")", Icon = "check", Duration = 4 })
+	freshLog("Welcome, " .. LP.Name .. " (" .. platform .. ")")
+end)
 
 local Flags = Fresh
 local Panel, QuickBar, accentRow, minRow, keyRow, qFpsRow, qPingRow
@@ -794,7 +804,7 @@ MoneyTab:AddToggle({
 
 MoneyTab:AddToggle({
 	Title = "Auto Upgrade Dealership",
-	Subtitle = "Buys upgrade pads, nearest first",
+	Subtitle = "Teleports pad to pad via Purchases, buys what is affordable",
 	Icon = "arrow-up-circle",
 	Default = false,
 	Callback = function(state)
@@ -820,18 +830,41 @@ MoneyTab:AddToggle({
 						return
 					end
 					local pads, seenP = {}, {}
-					for _, d in ipairs(mine:GetDescendants()) do
-						local okN, nm = pcall(function() return d.Name end)
-						if okN and nm and nm:lower():find("upgrade") then
-							local part = nil
-							pcall(function()
-								if d:IsA("BasePart") then part = d
-								elseif d:IsA("Model") then part = freshFirstPart(d) end
-							end)
-							if part and not seenP[part] then
-								seenP[part] = true
-								pads[#pads + 1] = part
+					local shop = nil
+					pcall(function()
+						shop = mine:FindFirstChild("Purchases")
+						if not shop then
+							for _, d in ipairs(mine:GetDescendants()) do
+								local okN, nm = pcall(function() return d.Name end)
+								if okN and nm == "Purchases" then shop = d break end
 							end
+						end
+					end)
+					local function pushPad(d)
+						local part = nil
+						pcall(function()
+							if d:IsA("BasePart") then part = d
+							elseif d:IsA("Model") or d:IsA("Folder") then part = freshFirstPart(d) end
+						end)
+						if part and not seenP[part] then
+							local okN, nm = pcall(function() return d.Name end)
+							seenP[part] = (okN and nm) or d.Name
+							pads[#pads + 1] = part
+						end
+					end
+					if shop then
+						local kids = {}
+						pcall(function() kids = shop:GetChildren() end)
+						for _, kid in ipairs(kids) do pushPad(kid) end
+						if #pads == 0 then
+							local descs = {}
+							pcall(function() descs = shop:GetDescendants() end)
+							for _, d in ipairs(descs) do pushPad(d) end
+						end
+					else
+						for _, d in ipairs(mine:GetDescendants()) do
+							local okN, nm = pcall(function() return d.Name end)
+							if okN and nm and nm:lower():find("upgrade") then pushPad(d) end
 						end
 					end
 					if #pads == 0 then
@@ -857,14 +890,20 @@ MoneyTab:AddToggle({
 					if okC and cf then freshGoto(cf + Vector3.new(0, 4, 0)) end
 					freshPromptBurst(pad.Position, 16)
 					freshTouch(pad)
-					freshStatus("Status: Upgrade - buying " .. tostring(pad.Name))
+					freshStatus("Status: Upgrade - buying " .. tostring(seenP[pad] or pad.Name))
 					local t0 = os.clock()
-					while Fresh.Upgrade and not FreshOff and (os.clock() - t0) < 25 do
+					local lastFire = 0
+					while Fresh.Upgrade and not FreshOff and (os.clock() - t0) < 15 do
 						local gone = false
 						pcall(function()
 							if (not pad.Parent) or (not pad:IsDescendantOf(workspace)) then gone = true end
 						end)
 						if gone then break end
+						if os.clock() - lastFire > 3 then
+							lastFire = os.clock()
+							pcall(function() freshPromptBurst(pad.Position, 16) end)
+							freshTouch(pad)
+						end
 						task.wait(1)
 					end
 					task.wait(1)
