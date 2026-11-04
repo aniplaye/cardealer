@@ -328,12 +328,73 @@ local MegaTunes = { Speed = 100, Torque = 30000 }
 local FlySpeed = 60
 local EspMaxDist = 2000
 
+-- per-instance stock values so accel scaling stays relative to stock
+local MegaStock = {} -- stock values keyed by full path (strong refs: must survive GC or scaling compounds)
+local MegaSpeedKeys = { topspeed = true, top_speed = true, maxspeed = true, max_speed = true, speed = true, vmax = true, maxvelocity = true }
+local MegaAccelKeys = { accel = true, acceleration = true, torque = true, power = true, horsepower = true, throttle = true, boost = true, launch = true, enginepower = true }
+
+local function megaTuneMatch(name)
+	local n = string.lower(tostring(name))
+	if MegaSpeedKeys[n] then return "speed" end
+	if MegaAccelKeys[n] then return "accel" end
+	return nil
+end
+
 local function megaTuneSeat()
 	local seat = freshSeat()
 	if not seat or not seat:IsA("VehicleSeat") then return false end
+	local tuned = 0
+	-- layer 1: raw seat physics (works on stock-chassis cars)
 	pcall(function() seat.MaxSpeed = MegaTunes.Speed end)
 	pcall(function() seat.Torque = MegaTunes.Torque end)
-	return true
+	tuned = tuned + 2
+	local car = freshCar(seat)
+	-- layer 2: attributes on the car model + seat (modern custom chassis read these)
+	for _, inst in ipairs(car and { car, seat } or { seat }) do
+		local okA, attrs = pcall(function() return inst:GetAttributes() end)
+		if okA and type(attrs) == "table" then
+			for nm, val in pairs(attrs) do
+				if type(val) == "number" then
+					local kind = megaTuneMatch(nm)
+					if kind then
+						local key = inst:GetFullName() .. "\0" .. nm
+						if MegaStock[key] == nil then MegaStock[key] = val end
+						local stock = MegaStock[key]
+						if stock == 0 then stock = 1 end
+						local want = kind == "speed" and MegaTunes.Speed or stock * (MegaTunes.Torque / 30000)
+						if pcall(function() inst:SetAttribute(nm, want) end) then tuned = tuned + 1 end
+					end
+				end
+			end
+		end
+	end
+	-- layer 3: NumberValue/IntValue tunables inside the car model
+	if car then
+		local descs = {}
+		pcall(function() descs = car:GetDescendants() end)
+		local n = 0
+		for _, d in ipairs(descs) do
+			n = n + 1
+			if n > 400 then break end
+			local okC, cls = pcall(function() return d.ClassName end)
+			if okC and (cls == "NumberValue" or cls == "IntValue" or cls == "DoubleConstrainedValue") then
+				local okN, nm = pcall(function() return d.Name end)
+				local kind = okN and megaTuneMatch(nm)
+				if kind then
+					local okG, cur = pcall(function() return d.Value end)
+					if okG and type(cur) == "number" then
+						local key = d:GetFullName()
+						if MegaStock[key] == nil then MegaStock[key] = cur end
+						local stock = MegaStock[key]
+						if stock == 0 then stock = 1 end
+						local want = kind == "speed" and MegaTunes.Speed or stock * (MegaTunes.Torque / 30000)
+						if pcall(function() d.Value = want end) then tuned = tuned + 1 end
+					end
+				end
+			end
+		end
+	end
+	return tuned
 end
 
 local function megaOwnTycoon()
@@ -403,7 +464,7 @@ local cruiseBox = MainTab:AddTextBox({
 
 farmToggle = MainTab:AddToggle({
 	Title = "Auto Farm (Cruise)",
-	Subtitle = "Runway -2750,605,4890 to 2220, holds W, never touches the car",
+	Subtitle = "Runway -2720,605,4890 to 2220, holds W, never touches the car",
 	Icon = "navigation",
 	Default = false,
 	Callback = function(state)
@@ -424,9 +485,9 @@ farmToggle = MainTab:AddToggle({
 		end
 		Fresh._cruiseRunning = true
 		task.spawn(function()
-			-- runway cruise: start (-2750,605,4890) -> end (-2750,605,2220), holds W, never pushes the car
-			local START_POS = Vector3.new(-2750, 605, 4890)
-			local END_POS = Vector3.new(-2750, 605, 2220)
+			-- runway cruise: start (-2720,605,4890) -> end (-2720,605,2220), holds W, never pushes the car
+			local START_POS = Vector3.new(-2720, 605, 4890)
+			local END_POS = Vector3.new(-2720, 605, 2220)
 			local VIM = nil
 			pcall(function() VIM = game:GetService("VirtualInputManager") end)
 			local function cruisePlace()
@@ -912,15 +973,24 @@ MoneyTab:AddToggle({
 							end)
 						end)
 					end
-					-- fast sweep: touch each pad and move on, no gone-wait
+					-- fast sweep: bob up/down on each pad so touch re-fires, then move on
 					for _, pad in ipairs(pads) do
 						if not Fresh.Upgrade or FreshOff then break end
 						local okC, cf = pcall(function() return pad.CFrame end)
-						if okC and cf then freshGoto(cf + Vector3.new(0, 4, 0)) end
-						pcall(function() freshPromptBurst(pad.Position, 16) end)
-						freshTouch(pad)
+						if okC and cf then
+							for _, h in ipairs({ 4, 2, 4, 2 }) do
+								if not Fresh.Upgrade or FreshOff then break end
+								freshGoto(cf + Vector3.new(0, h, 0))
+								pcall(function() freshPromptBurst(pad.Position, 16) end)
+								freshTouch(pad)
+								task.wait(0.15)
+							end
+						else
+							pcall(function() freshPromptBurst(pad.Position, 16) end)
+							freshTouch(pad)
+						end
 						freshStatus("Status: Upgrade - buying " .. tostring(seenP[pad] or pad.Name))
-						task.wait(0.7)
+						task.wait(0.2)
 					end
 					task.wait(1)
 				end)
@@ -1161,14 +1231,65 @@ GarageTab:AddSlider({
 })
 
 GarageTab:AddButton({
+	Title = "Scan Car Values",
+	Subtitle = "Dumps tunable numbers (paste the file back to me)",
+	Icon = "search",
+	Text = "Scan",
+	Callback = function()
+		local seat = freshSeat()
+		if not seat then freshNotify("Scan: sit in a car first") return end
+		task.spawn(function()
+			local lines = { "Vena car scan " .. os.date("%X") }
+			pcall(function()
+				table.insert(lines, "SEAT " .. seat:GetFullName() .. " (" .. seat.ClassName .. ")")
+				table.insert(lines, "  MaxSpeed=" .. tostring(seat.MaxSpeed) .. " Torque=" .. tostring(seat.Torque))
+				local okT, ts = pcall(function() return seat.TurnSpeed end)
+				if okT then table.insert(lines, "  TurnSpeed=" .. tostring(ts)) end
+			end)
+			local car = freshCar(seat)
+			if car then
+				pcall(function()
+					table.insert(lines, "CAR " .. car:GetFullName())
+					for nm, val in pairs(car:GetAttributes()) do
+						table.insert(lines, "  attr " .. tostring(nm) .. "=" .. tostring(val))
+					end
+				end)
+				local descs = {}
+				pcall(function() descs = car:GetDescendants() end)
+				local n = 0
+				for _, d in ipairs(descs) do
+					n = n + 1
+					if n > 500 then table.insert(lines, "  ...truncated") break end
+					local okC, cls = pcall(function() return d.ClassName end)
+					if okC and (cls == "NumberValue" or cls == "IntValue" or cls == "DoubleConstrainedValue" or cls == "BoolValue" or cls == "StringValue") then
+						local okD, txt = pcall(function()
+							return "  " .. cls .. " " .. d:GetFullName() .. " = " .. tostring(d.Value)
+						end)
+						if okD then table.insert(lines, txt) end
+					end
+				end
+			end
+			local shown = 0
+			for _, ln in ipairs(lines) do
+				if shown < 40 then freshLog(ln) shown = shown + 1 end
+			end
+			if #lines > 40 then freshLog("... +" .. tostring(#lines - 40) .. " more lines in file") end
+			pcall(function() writefile("venas_car_scan.txt", table.concat(lines, "\n")) end)
+			freshNotify("Car scan saved (" .. #lines .. " lines)")
+		end)
+	end,
+})
+
+GarageTab:AddButton({
 	Title = "Tune Current Car",
 	Subtitle = "Applies the sliders to the car you are sitting in",
 	Icon = "wrench",
 	Text = "Tune",
 	Callback = function()
-		if megaTuneSeat() then
-			freshLog("Tuned: speed " .. tostring(MegaTunes.Speed) .. ", torque " .. tostring(MegaTunes.Torque))
-			freshStatus("Status: car tuned")
+		local n = megaTuneSeat()
+		if n then
+			freshLog("Tuned " .. tostring(n) .. " values (speed " .. tostring(MegaTunes.Speed) .. ", torque x" .. tostring(math.floor(MegaTunes.Torque / 300 + 0.5) / 100) .. ")")
+			freshStatus("Status: car tuned (" .. tostring(n) .. " values)")
 		else
 			freshNotify("Tune: sit in a car first")
 		end
